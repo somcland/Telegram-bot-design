@@ -152,6 +152,43 @@ def send(text: str) -> bool:
     return False
 
 
+MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+          "августа", "сентября", "октября", "ноября", "декабря"]
+
+
+def digest_header(count: int) -> str:
+    """Первое сообщение каждой подборки: что это за бот и за какой день."""
+    msk = time.gmtime(time.time() + 3 * 3600)
+    date = f"{msk.tm_mday} {MONTHS[msk.tm_mon - 1]}"
+    return (
+        f"🎨 <b>Дизайн-дайджест · {date}</b>\n\n"
+        f"Свежие новости российского дизайна: айдентика, брендинг, "
+        f"интерфейсы, кейсы. Сегодня в подборке: {count}."
+    )
+
+
+def update_bot_profile() -> None:
+    """Описание бота — его видно, когда человек открывает бота, до кнопки «Старт»."""
+    if DRY_RUN:
+        return
+    base = f"https://api.telegram.org/bot{TOKEN}"
+    calls = {
+        "setMyDescription": {"description": (
+            "🎨 Дизайн-дайджест\n\n"
+            "Каждое утро в 10:00 по Москве присылаю подборку новостей "
+            "российского дизайна: айдентика, брендинг, упаковка, интерфейсы, "
+            "кейсы и статьи с Sostav, Cossa и Хабра."
+        )},
+        "setMyShortDescription": {"short_description":
+            "Ежедневный дайджест новостей российского дизайна"},
+    }
+    for method, payload in calls.items():
+        try:
+            requests.post(f"{base}/{method}", json=payload, timeout=30)
+        except Exception as e:  # описание — не критично, рассылка важнее
+            print(f"[!] {method}: {e}", file=sys.stderr)
+
+
 # ---------- основной цикл ----------
 
 def main() -> None:
@@ -195,7 +232,12 @@ def main() -> None:
         to_send = fresh[-limit:]
         seen_list.extend(i["link"] for i in fresh[:-limit])  # переполнение не шлём
 
+    update_bot_profile()
+
     sent = 0
+    if to_send:
+        send(digest_header(len(to_send)))
+        time.sleep(1.2)
     for item in to_send:
         if send(format_message(item)):
             seen_list.append(item["link"])
