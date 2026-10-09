@@ -23,6 +23,8 @@ from urllib.parse import urlsplit, urlunsplit
 import feedparser
 import requests
 
+import youtube
+
 ROOT = Path(__file__).parent
 CONFIG_PATH = ROOT / "config.json"
 SEEN_PATH = ROOT / "seen.json"
@@ -244,8 +246,26 @@ def main() -> None:
             sent += 1
             time.sleep(1.2)  # бережём лимиты Telegram
 
+    # ---------- YouTube: только новые видео, без новых — молчим ----------
+    videos_sent = 0
+    for channel in cfg.get("youtube", []):
+        videos = youtube.fetch_channel(channel)
+        if not videos:
+            continue
+        new = [v for v in videos if v["link"] not in seen]
+        # канал проверяется впервые: запоминаем всё, что уже есть, ничего не шлём
+        if len(new) == len(videos):
+            seen_list.extend(v["link"] for v in videos)
+            print(f"YouTube «{channel['name']}»: первая проверка, запомнил {len(videos)} видео")
+            continue
+        for video in sorted(new, key=lambda v: v["ts"]):
+            if send(youtube.format_video_message(video)):
+                seen_list.append(video["link"])
+                videos_sent += 1
+                time.sleep(1.2)
+
     save_seen(seen_list)
-    print(f"Найдено новых: {len(fresh)}, отправлено: {sent}")
+    print(f"Найдено новых: {len(fresh)}, отправлено: {sent}, видео: {videos_sent}")
 
 
 if __name__ == "__main__":
