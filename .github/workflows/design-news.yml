@@ -1,0 +1,42 @@
+name: Design news → Telegram
+
+on:
+  schedule:
+    # каждый день в 9:55 по Москве (6:55 UTC). GitHub часто запускает
+    # с задержкой 5–15 минут, так что дайджест придёт около 10:00
+    - cron: "55 6 * * *"
+  workflow_dispatch: # кнопка «Run workflow» для ручного запуска
+
+permissions:
+  contents: write # чтобы сохранять seen.json обратно в репозиторий
+
+concurrency:
+  group: design-news
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Собрать и отправить новости
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py
+
+      - name: Запомнить отправленное
+        run: |
+          git config user.name "design-news-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add seen.json
+          git diff --cached --quiet || git commit -m "update seen.json"
+          git push

@@ -1,0 +1,35 @@
+{
+  "feeds": [
+    {
+      "name": "Sostav",
+      "url": "https://www.sostav.ru/rss",
+      "filter": true
+    },
+    {
+      "name": "Cossa",
+      "url": "https://www.cossa.ru/rss/",
+      "filter": true
+    },
+    {
+      "name": "Хабр · Дизайн",
+      "url": "https://habr.com/ru/rss/hubs/design/articles/",
+      "filter": false
+    }
+  ],
+
+  "keywords": [
+    "дизайн", "дизайнер", "айдентик", "брендинг", "ребрендинг", "редизайн",
+    "логотип", "упаковк", "визуал", "фирменный стиль",
+    "шрифт", "типограф", "леттеринг", "иллюстрац", "плакат", "постер",
+    "моушн", "анимац", "3d", "интерфейс", "дизайн-систем",
+    "figma", "фигма", "ux", "ui", "kv", "ключевой визуал",
+    "adcr", "red dot"
+  ],
+
+  "stop_words": [
+    "вакансия", "тендер"
+  ],
+
+  "max_posts_per_run": 30,
+  "first_run_send_last": 5
+}
