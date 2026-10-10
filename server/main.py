@@ -390,36 +390,96 @@ async def send_batch(bot, chat_id: int, header: str = "") -> int:
                                    reply_markup=more if n == len(texts) - 1 else None)
             await asyncio.sleep(0.1)
     else:
-        for n, i in enumerate(items):
-            title, text = ready[i["link"]]
-            markup = more if n == len(items) - 1 else None
-            body = entry(i, title, text)
-            photo = None
-            for pic in await asyncio.to_thread(image_candidates, i):
-                photo = await asyncio.to_thread(sources.download_image, pic, i["link"])
-                if photo:
-                    break
-            sent = False
-            if photo and len(body) <= 1024:
-                if n == 0 and header:
-                    await bot.send_message(chat_id, header, parse_mode=ParseMode.HTML)
-                try:  # одно сообщение: картинка, под ней заголовок, хайлайт и ссылка
-                    await bot.send_photo(chat_id, photo, caption=body, parse_mode=ParseMode.HTML,
-                                         reply_markup=markup)
-                    sent = True
-                except Forbidden:
-                    raise
-                except TelegramError as e:
-                    log.info("картинка не отправилась (%s): %s", i["link"], e)
-                head = ""
-            else:
-                head = f"{header}\n\n" if header and n == 0 else ""
-            if not sent:
-                await bot.send_message(chat_id, head + body, parse_mode=ParseMode.HTML,
-                                       link_preview_options=NO_PREVIEW, reply_markup=markup)
-            await asyncio.sleep(0.1)
+        photos = await asyncio.to_thread(collect_photos, items)
+        if not await send_rich(bot, chat_id, header, items, ready, photos, more):
+            await send_separately(bot, chat_id, header, items, ready, photos, more)
     storage.mark_delivered(chat_id, [i["link"] for i in items], "digest")
     return len(items)
+
+
+def collect_photos(items) -> dict[str, tuple[str, bytes]]:
+    """link → (адрес картинки, скачанные байты). Без картинки материала в словаре нет."""
+    out = {}
+    for i in items:
+        for pic in image_candidates(i):
+            data = sources.download_image(pic, i["link"])
+            if data:
+                out[i["link"]] = (pic, data)
+                break
+    return out
+
+
+def rich_html(header: str, items, ready, photos, uploaded: bool) -> str:
+    """Одна «статья»: шапка, затем для каждого материала заголовок, картинка, хайлайт, ссылка."""
+    parts = [f"<p>{header.replace(chr(10), '<br/>')}</p>"] if header else []
+    for n, i in enumerate(items):
+        title, text = ready[i["link"]]
+        parts.append(f"<p>{title_line(i, title)}</p>")
+        if i["link"] in photos:
+            src = f"tg://photo?id=p{n}" if uploaded else html.escape(photos[i["link"]][0])
+            parts.append(f'<img src="{src}"/>')
+        parts.append(f"<p>{caption(i, text).replace(chr(10), '<br/>')}</p>")
+    return "".join(parts)
+
+
+def _rich_request(token: str, chat_id: int, html_text: str, photos, items, uploaded: bool, more) -> dict:
+    rich = {"html": html_text, "skip_entity_detection": True}
+    files = {}
+    if uploaded:
+        rich["media"] = []
+        for n, i in enumerate(items):
+            if i["link"] in photos:
+                rich["media"].append({"id": f"p{n}", "media": {"type": "photo", "media": f"attach://p{n}"}})
+                files[f"p{n}"] = (f"p{n}.jpg", photos[i["link"]][1])
+    data = {"chat_id": str(chat_id), "rich_message": json.dumps(rich, ensure_ascii=False)}
+    if more:
+        data["reply_markup"] = json.dumps(more.to_dict(), ensure_ascii=False)
+    r = requests.post(f"https://api.telegram.org/bot{token}/sendRichMessage",
+                      data=data, files=files or None, timeout=120)
+    return r.json()
+
+
+async def send_rich(bot, chat_id: int, header: str, items, ready, photos, more) -> bool:
+    """Всё одним сообщением-статьёй (Bot API 10.1+). Сначала картинки файлами, потом ссылками."""
+    for uploaded in ([True, False] if photos else [False]):
+        html_text = rich_html(header, items, ready, photos, uploaded)
+        try:
+            res = await asyncio.to_thread(_rich_request, bot.token, chat_id, html_text, photos,
+                                          items, uploaded, more)
+        except Exception as e:
+            log.warning("статья не отправилась: %s", e)
+            continue
+        if res.get("ok"):
+            if more and not res["result"].get("reply_markup"):  # кнопку к статье не прикрепили
+                await bot.send_message(chat_id, "Это не всё 👇", reply_markup=more)
+            return True
+        if res.get("error_code") == 403:
+            raise Forbidden(res.get("description", ""))
+        log.warning("статья не отправилась (%s): %s", "файлы" if uploaded else "ссылки",
+                    res.get("description"))
+    return False
+
+
+async def send_separately(bot, chat_id: int, header: str, items, ready, photos, more) -> None:
+    """Запасной вариант: каждый материал своим сообщением с картинкой."""
+    for n, i in enumerate(items):
+        title, text = ready[i["link"]]
+        markup = more if n == len(items) - 1 else None
+        body = entry(i, title, text)
+        head = f"{header}\n\n" if header and n == 0 else ""
+        if i["link"] in photos and len(head + body) <= 1024:
+            try:
+                await bot.send_photo(chat_id, photos[i["link"]][1], caption=head + body,
+                                     parse_mode=ParseMode.HTML, reply_markup=markup)
+                await asyncio.sleep(0.1)
+                continue
+            except Forbidden:
+                raise
+            except TelegramError as e:
+                log.info("картинка не отправилась (%s): %s", i["link"], e)
+        await bot.send_message(chat_id, head + body, parse_mode=ParseMode.HTML,
+                               link_preview_options=NO_PREVIEW, reply_markup=markup)
+        await asyncio.sleep(0.1)
 
 
 async def send_digest(bot, chat_id: int, on_demand: bool = False) -> int:
