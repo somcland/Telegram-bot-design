@@ -63,9 +63,25 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+HIGHLIGHT_VERSION = "1-sentence"
+
+
 def init() -> None:
     with connect() as c:
         c.executescript(SCHEMA)
+        # миграции для уже работающей базы
+        cols = {r[1] for r in c.execute("PRAGMA table_info(users)")}
+        if "hour" not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN hour INTEGER DEFAULT 10")
+        if "tz" not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN tz TEXT DEFAULT 'Europe/Moscow'")
+        if "last_sent" not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN last_sent TEXT")
+        c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        row = c.execute("SELECT value FROM meta WHERE key='highlight'").fetchone()
+        if not row or row[0] != HIGHLIGHT_VERSION:  # формат хайлайтов поменялся — пересчитать
+            c.execute("UPDATE items SET ru_title=NULL, ru_summary=NULL")
+            c.execute("INSERT OR REPLACE INTO meta VALUES ('highlight', ?)", (HIGHLIGHT_VERSION,))
         for s in json.loads(CATALOG.read_text(encoding="utf-8"))["sources"]:
             c.execute(
                 """INSERT INTO sources (id, kind, name, url, lang, filter, builtin, is_default)
@@ -99,9 +115,27 @@ def set_active(chat_id: int, active: bool) -> None:
         c.execute("UPDATE users SET active=? WHERE chat_id=?", (int(active), chat_id))
 
 
-def active_users() -> list[int]:
+def active_users() -> list[sqlite3.Row]:
     with connect() as c:
-        return [r[0] for r in c.execute("SELECT chat_id FROM users WHERE active=1")]
+        return c.execute("SELECT * FROM users WHERE active=1").fetchall()
+
+
+def get_user(chat_id: int) -> sqlite3.Row | None:
+    with connect() as c:
+        return c.execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+
+
+def set_schedule(chat_id: int, hour: int | None = None, tz: str | None = None) -> None:
+    with connect() as c:
+        if hour is not None:
+            c.execute("UPDATE users SET hour=? WHERE chat_id=?", (hour, chat_id))
+        if tz is not None:
+            c.execute("UPDATE users SET tz=? WHERE chat_id=?", (tz, chat_id))
+
+
+def set_last_sent(chat_id: int, day: str) -> None:
+    with connect() as c:
+        c.execute("UPDATE users SET last_sent=? WHERE chat_id=?", (day, chat_id))
 
 
 def menu_sources(chat_id: int) -> list[sqlite3.Row]:

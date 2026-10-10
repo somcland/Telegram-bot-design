@@ -2,11 +2,11 @@
 Дизайн-дайджест: персональный Telegram-бот.
 
 /start     — подписаться (включаются источники по умолчанию) и открыть настройки
-/settings  — выбрать YouTube-каналы, сайты и Telegram-каналы, добавить свои
+/settings  — выбрать источники и время рассылки, добавить свои
 /digest    — прислать свежее прямо сейчас
 /stop      — отписаться
 
-Каждый день в 10:00 по Москве каждый получает подборку из своих источников.
+Каждый получает подборку в своё время (по умолчанию 10:00 по Москве).
 Если нового нет — «главное за неделю».
 
 Запуск: python -m server.main  (токен в переменной TELEGRAM_BOT_TOKEN)
@@ -33,7 +33,18 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("design-bot")
 
 MSK = ZoneInfo("Europe/Moscow")
-DIGEST_TIME = dt.time(10, 0, tzinfo=MSK)
+DEFAULT_HOUR = 10
+HOURS = list(range(6, 24))
+CATCH_UP_HOURS = 3   # если бот был выключен в нужный час — досылаем в течение 3 часов
+TIMEZONES = [
+    ("Europe/Kaliningrad", "Калининград"), ("Europe/Moscow", "Москва"),
+    ("Europe/Samara", "Самара"), ("Asia/Yekaterinburg", "Екатеринбург"),
+    ("Asia/Aqtau", "Актау · Астана"), ("Asia/Omsk", "Омск"),
+    ("Asia/Novosibirsk", "Новосибирск"), ("Asia/Irkutsk", "Иркутск"),
+    ("Asia/Vladivostok", "Владивосток"), ("Asia/Tbilisi", "Тбилиси · Ереван"),
+    ("Europe/Berlin", "Европа (Берлин)"), ("Asia/Bangkok", "Бангкок"),
+]
+TZ_NAMES = dict(TIMEZONES)
 DIGEST_LIMIT = 15
 RECAP_LIMIT = 7
 NEW_WINDOW = 48 * 3600     # «новое» — не старше двух суток
@@ -50,10 +61,10 @@ KINDS = {
 
 WELCOME = (
     "🎨 <b>Дизайн-дайджест</b>\n\n"
-    "Каждое утро в 10:00 по Москве присылаю подборку из выбранных тобой источников: "
+    "Каждый день присылаю подборку из выбранных тобой источников: "
     "новости дизайна, статьи (английские — с переводом), новые видео с хайлайтами "
     "и посты из Telegram-каналов.\n\n"
-    "Отметь, что тебе интересно 👇"
+    "Отметь, что тебе интересно, и выбери время 👇"
 )
 MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
           "августа", "сентября", "октября", "ноября", "декабря"]
@@ -62,8 +73,38 @@ NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 # ---------- меню ----------
 
+def when_label(chat_id: int) -> str:
+    u = storage.get_user(chat_id)
+    hour = u["hour"] if u and u["hour"] is not None else DEFAULT_HOUR
+    tz = u["tz"] if u and u["tz"] else "Europe/Moscow"
+    return f"{hour}:00 ({TZ_NAMES.get(tz, tz)})"
+
+
+def time_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    u = storage.get_user(chat_id)
+    cur = u["hour"] if u and u["hour"] is not None else DEFAULT_HOUR
+    btns = [InlineKeyboardButton(("✅ " if h == cur else "") + f"{h}:00", callback_data=f"h:{h}")
+            for h in HOURS]
+    rows = [btns[i:i + 4] for i in range(0, len(btns), 4)]
+    tz = (u["tz"] if u else None) or "Europe/Moscow"
+    rows.append([InlineKeyboardButton(f"🌍 Часовой пояс: {TZ_NAMES.get(tz, tz)}",
+                                      callback_data="tz")])
+    rows.append([InlineKeyboardButton("← К источникам", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tz_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    u = storage.get_user(chat_id)
+    cur = (u["tz"] if u else None) or "Europe/Moscow"
+    btns = [InlineKeyboardButton(("✅ " if z == cur else "") + name, callback_data=f"z:{z}")
+            for z, name in TIMEZONES]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([InlineKeyboardButton("← Ко времени", callback_data="time")])
+    return InlineKeyboardMarkup(rows)
+
+
 def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    rows = []
+    rows = [[InlineKeyboardButton(f"🕙 Присылать в {when_label(chat_id)}", callback_data="time")]]
     srcs = storage.menu_sources(chat_id)
     for kind, (title, add_label, _) in KINDS.items():
         rows.append([InlineKeyboardButton(title, callback_data="noop")])
@@ -128,11 +169,30 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data["awaiting"] = kind
         await q.answer()
         await q.message.reply_text(KINDS[kind][2] + "\n\nПередумал — /cancel")
+    elif data == "time":
+        await q.answer()
+        await q.edit_message_text("Во сколько присылать подборку? Время — по твоему часовому поясу.",
+                                  reply_markup=time_keyboard(chat_id))
+    elif data.startswith("h:"):
+        storage.set_schedule(chat_id, hour=int(data[2:]))
+        await q.answer(f"Буду присылать в {data[2:]}:00")
+        await q.edit_message_reply_markup(time_keyboard(chat_id))
+    elif data == "tz":
+        await q.answer()
+        await q.edit_message_text("Выбери часовой пояс:", reply_markup=tz_keyboard(chat_id))
+    elif data.startswith("z:"):
+        storage.set_schedule(chat_id, tz=data[2:])
+        await q.answer(f"Часовой пояс: {TZ_NAMES.get(data[2:], data[2:])}")
+        await q.edit_message_text("Во сколько присылать подборку? Время — по твоему часовому поясу.",
+                                  reply_markup=time_keyboard(chat_id))
+    elif data == "back":
+        await q.answer()
+        await q.edit_message_text("Твои источники 👇", reply_markup=settings_keyboard(chat_id))
     elif data == "done":
         n = len(storage.user_source_ids(chat_id))
         await q.answer()
         await q.edit_message_text(
-            f"Готово! Источников выбрано: {n}. Подборка придёт завтра в 10:00 по Москве.\n\n"
+            f"Готово! Источников выбрано: {n}. Подборка будет приходить каждый день в {when_label(chat_id)}.\n\n"
             "Хочешь прямо сейчас — /digest. Поменять источники — /settings.")
 
 
@@ -272,11 +332,30 @@ async def job_refresh(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await asyncio.to_thread(refresh, storage.subscribed_sources())
 
 
-async def job_daily(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await asyncio.to_thread(refresh, storage.subscribed_sources())
-    users = storage.active_users()
-    log.info("утренняя рассылка: %d подписчиков", len(users))
-    for chat_id in users:
+def due_users(now: dt.datetime | None = None) -> list:
+    """Кому пора отправить: наступил их час в их часовом поясе, а сегодня ещё не отправляли."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    due = []
+    for u in storage.active_users():
+        try:
+            local = now.astimezone(ZoneInfo(u["tz"] or "Europe/Moscow"))
+        except Exception:
+            local = now.astimezone(MSK)
+        hour = u["hour"] if u["hour"] is not None else DEFAULT_HOUR
+        if hour <= local.hour < hour + CATCH_UP_HOURS and u["last_sent"] != local.date().isoformat():
+            due.append((u["chat_id"], local.date().isoformat()))
+    return due
+
+
+async def job_send(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в 10 минут: кому пора — тем подборка."""
+    due = due_users()
+    if not due:
+        return
+    ids = sorted({sid for chat_id, _ in due for sid in storage.user_source_ids(chat_id)})
+    await asyncio.to_thread(refresh, storage.sources_by_ids(ids))
+    log.info("рассылка: %d подписчиков", len(due))
+    for chat_id, day in due:
         try:
             if not await send_digest(ctx.bot, chat_id):
                 await send_recap(ctx.bot, chat_id)
@@ -285,6 +364,11 @@ async def job_daily(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             log.info("%s заблокировал бота — отписал", chat_id)
         except TelegramError as e:
             log.warning("не доставил %s: %s", chat_id, e)
+            continue
+        storage.set_last_sent(chat_id, day)
+
+
+async def job_cleanup(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     storage.cleanup()
 
 
@@ -301,7 +385,7 @@ async def post_init(app: Application) -> None:
         BotCommand("stop", "Отписаться"),
     ])
     await app.bot.set_my_description(
-        "🎨 Дизайн-дайджест\n\nКаждое утро в 10:00 по Москве — подборка из выбранных тобой "
+        "🎨 Дизайн-дайджест\n\nКаждый день в удобное тебе время — подборка из выбранных тобой "
         "источников: новости дизайна, статьи с переводом, новые видео с хайлайтами и посты "
         "из Telegram-каналов. Источники выбираешь сам.")
     await app.bot.set_my_short_description("Персональный дайджест новостей дизайна")
@@ -322,7 +406,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
     app.add_error_handler(on_error)
-    app.job_queue.run_daily(job_daily, DIGEST_TIME, name="daily")
+    app.job_queue.run_repeating(job_send, interval=600, first=30, name="send")
+    app.job_queue.run_repeating(job_cleanup, interval=24 * 3600, first=3600, name="cleanup")
     app.job_queue.run_repeating(job_refresh, interval=3 * 3600, first=60, name="refresh")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
