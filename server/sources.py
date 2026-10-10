@@ -152,6 +152,18 @@ def og_image(soup, base: str) -> str:
     return _abs(tag.get("content", ""), base) if tag else ""
 
 
+def download_image(url: str, referer: str = "") -> bytes | None:
+    """Скачиваем картинку сами: Telegram часто не может забрать её по ссылке."""
+    try:
+        r = requests.get(url, headers={**HEADERS, "Referer": referer or url}, timeout=20)
+        r.raise_for_status()
+        if not r.headers.get("content-type", "").startswith("image/") or not 1000 < len(r.content) < 9_000_000:
+            return None
+        return r.content
+    except Exception:
+        return None
+
+
 def page_image(link: str) -> str:
     """Картинка со страницы статьи (og:image) — если в ленте её не было."""
     try:

@@ -393,27 +393,29 @@ async def send_batch(bot, chat_id: int, header: str = "") -> int:
         for n, i in enumerate(items):
             title, text = ready[i["link"]]
             markup = more if n == len(items) - 1 else None
-            head = f"{header}\n\n" if header and n == 0 else ""
-            pics = await asyncio.to_thread(image_candidates, i)
+            body = entry(i, title, text)
+            photo = None
+            for pic in await asyncio.to_thread(image_candidates, i):
+                photo = await asyncio.to_thread(sources.download_image, pic, i["link"])
+                if photo:
+                    break
             sent = False
-            if pics:
-                await bot.send_message(chat_id, head + title_line(i, title), parse_mode=ParseMode.HTML,
-                                       link_preview_options=NO_PREVIEW)
-                for pic in pics:
-                    try:
-                        await bot.send_photo(chat_id, pic, caption=caption(i, text),
-                                             parse_mode=ParseMode.HTML, reply_markup=markup)
-                        sent = True
-                        break
-                    except Forbidden:
-                        raise
-                    except TelegramError as e:
-                        log.info("картинка не отправилась (%s): %s", pic, e)
-                if not sent:  # заголовок уже ушёл — досылаем текст без картинки
-                    await bot.send_message(chat_id, caption(i, text), parse_mode=ParseMode.HTML,
-                                           link_preview_options=NO_PREVIEW, reply_markup=markup)
+            if photo and len(body) <= 1024:
+                if n == 0 and header:
+                    await bot.send_message(chat_id, header, parse_mode=ParseMode.HTML)
+                try:  # одно сообщение: картинка, под ней заголовок, хайлайт и ссылка
+                    await bot.send_photo(chat_id, photo, caption=body, parse_mode=ParseMode.HTML,
+                                         reply_markup=markup)
+                    sent = True
+                except Forbidden:
+                    raise
+                except TelegramError as e:
+                    log.info("картинка не отправилась (%s): %s", i["link"], e)
+                head = ""
             else:
-                await bot.send_message(chat_id, head + entry(i, title, text), parse_mode=ParseMode.HTML,
+                head = f"{header}\n\n" if header and n == 0 else ""
+            if not sent:
+                await bot.send_message(chat_id, head + body, parse_mode=ParseMode.HTML,
                                        link_preview_options=NO_PREVIEW, reply_markup=markup)
             await asyncio.sleep(0.1)
     storage.mark_delivered(chat_id, [i["link"] for i in items], "digest")
