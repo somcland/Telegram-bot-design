@@ -206,23 +206,71 @@ def _claude(prompt: str, max_tokens: int = 500) -> str:
         return ""
 
 
-def translate(title: str, summary: str) -> tuple[str, str] | None:
-    out = _claude(
-        "Переведи на русский заголовок и перескажи анонс статьи о дизайне в 2–3 предложениях. "
-        "Ответь строго JSON без пояснений: {\"title\": \"...\", \"summary\": \"...\"}.\n\n"
-        f"Title: {title}\n\nAnnouncement: {summary[:3000]}")
-    m = re.search(r"\{.*\}", out, re.S)
+SENTENCE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def few_sentences(text: str, max_sentences: int = 3, max_len: int = 320) -> str:
+    """Без ИИ: первые 2–3 предложения текста."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    out = ""
+    for i, sent in enumerate(SENTENCE.split(text)):
+        if i >= max_sentences or (out and len(out) + len(sent) > max_len):
+            break
+        out = f"{out} {sent}".strip()
+    return out or short(text, max_len)
+
+
+def _json_from(text: str):
+    m = re.search(r"(\[.*\]|\{.*\})", text, re.S)
     if not m:
         return None
     try:
-        d = json.loads(m.group(0))
-        return d.get("title") or title, d.get("summary") or ""
+        return json.loads(m.group(1))
     except json.JSONDecodeError:
         return None
 
 
-def video_highlights(item) -> str:
+HIGHLIGHT_RULES = (
+    "Напиши хайлайт на русском в 2–3 коротких предложениях: о чём материал и что в нём главное "
+    "для дизайнера. Опирайся только на данный текст, ничего не придумывай, без вводных фраз "
+    "вроде «В статье рассказывается». Заголовок переведи на русский, если он на другом языке, "
+    "иначе оставь как есть."
+)
+
+
+def highlight_texts(items: list[dict]) -> dict[str, tuple[str, str]]:
+    """Статьи и посты пачкой: link → (заголовок на русском, хайлайт)."""
+    result = {}
+    for start in range(0, len(items), 12):
+        batch = items[start:start + 12]
+        payload = [{"id": n, "title": i["title"], "text": (i.get("summary") or "")[:1500]}
+                   for n, i in enumerate(batch)]
+        data = _json_from(_claude(
+            HIGHLIGHT_RULES + "\n\nДля каждого материала ниже ответь строго JSON-массивом "
+            '[{"id": 0, "title": "...", "highlight": "..."}] без пояснений.\n\n'
+            + json.dumps(payload, ensure_ascii=False), max_tokens=3000))
+        for d in data if isinstance(data, list) else []:
+            try:
+                item = batch[int(d["id"])]
+            except (KeyError, ValueError, IndexError, TypeError):
+                continue
+            if d.get("highlight"):
+                result[item["link"]] = (d.get("title") or item["title"], d["highlight"].strip())
+    return result
+
+
+def highlight_video(item) -> tuple[str, str, bool]:
+    """Видео по субтитрам и описанию: (заголовок на русском, хайлайт, сделано ли ИИ)."""
     extra = json.loads(item["extra"] or "{}")
-    transcript = youtube.get_transcript(extra.get("id", "")) if extra.get("id") else ""
     desc = extra.get("description", "")
-    return youtube.ai_highlights(item["title"], desc, transcript) or youtube.fallback_highlights(desc)
+    transcript = youtube.get_transcript(extra["id"])[:40000] if extra.get("id") else ""
+    data = _json_from(_claude(
+        HIGHLIGHT_RULES + ' Ответь строго JSON: {"title": "...", "highlight": "..."}.\n\n'
+        f"Название видео: {item['title']}\n\nОписание:\n{desc[:4000]}\n\n"
+        + (f"Субтитры:\n{transcript}" if transcript else "Субтитров нет."), max_tokens=600))
+    if isinstance(data, dict) and data.get("highlight"):
+        return data.get("title") or item["title"], data["highlight"].strip(), True
+    # без ИИ: описание без ссылок и таймкодов
+    lines = [l for l in desc.splitlines()
+             if l.strip() and "http" not in l and not youtube.TIMECODE.match(l)]
+    return item["title"], few_sentences(" ".join(lines)), False

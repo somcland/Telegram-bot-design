@@ -34,7 +34,7 @@ log = logging.getLogger("design-bot")
 
 MSK = ZoneInfo("Europe/Moscow")
 DIGEST_TIME = dt.time(10, 0, tzinfo=MSK)
-DIGEST_LIMIT = 25
+DIGEST_LIMIT = 15
 RECAP_LIMIT = 7
 NEW_WINDOW = 48 * 3600     # «новое» — не старше двух суток
 WEEK = 7 * 24 * 3600
@@ -177,35 +177,51 @@ def refresh(srcs) -> None:
             log.info("%s: +%d", s["name"], added)
 
 
-def render(item) -> str:
-    """Готовит текст одного материала: перевод для английских, хайлайты для видео."""
-    title, summary = item["title"], item["summary"] or ""
-    if item["source_kind"] == "youtube":
-        if item["ru_summary"] is None:
-            body = sources.video_highlights(item)
-            storage.set_translation(item["link"], title, body)
+def prepare(items) -> dict[str, tuple[str, str]]:
+    """Заголовок и хайлайт для каждого материала. Готовые берём из базы, новые считаем и сохраняем."""
+    ready, texts = {}, []
+    for i in items:
+        if i["ru_summary"] is not None:
+            ready[i["link"]] = (i["ru_title"] or i["title"], i["ru_summary"])
+        elif i["source_kind"] == "youtube":
+            title, text, by_ai = sources.highlight_video(i)
+            ready[i["link"]] = (title, text)
+            if by_ai:  # без ИИ не кешируем: вдруг ключ добавят позже
+                storage.set_translation(i["link"], title, text)
         else:
-            body = item["ru_summary"]
-        parts = [f"🎬 <b>{html.escape(title)}</b>", f"<i>{html.escape(item['source_name'])}</i>"]
-        if body:
-            parts.append("Что внутри:\n" + html.escape(body))
-        parts.append(f'<a href="{html.escape(item["link"])}">Смотреть на YouTube →</a>')
-        return "\n\n".join(parts)
+            texts.append(dict(i))
+    if texts:
+        done = sources.highlight_texts(texts)
+        for i in texts:
+            title, text = done.get(i["link"]) or (i["title"], sources.few_sentences(i["summary"]))
+            ready[i["link"]] = (title, text)
+            if i["link"] in done:  # без ИИ не кешируем: вдруг ключ добавят позже
+                storage.set_translation(i["link"], title, text)
+    return ready
 
-    if item["lang"] == "en":
-        if item["ru_title"]:
-            title, summary = item["ru_title"], item["ru_summary"]
+
+ICONS = {"youtube": "🎬 ", "telegram": "💬 "}
+
+
+def entry(item, title: str, text: str) -> str:
+    link = html.escape(item["link"])
+    out = f"{ICONS.get(item['source_kind'], '')}<b>{html.escape(title)}</b>"
+    if text:
+        out += "\n" + html.escape(text)
+    return out + f'\n<a href="{link}">{html.escape(item["source_name"])} →</a>'
+
+
+def pack(header: str, entries: list[str], limit: int = 4000) -> list[str]:
+    """Всё одним сообщением; если не влезает в лимит Telegram — продолжение следующим."""
+    messages, current = [], header
+    for e in entries:
+        if len(current) + 2 + len(e) > limit:
+            messages.append(current)
+            current = e
         else:
-            tr = sources.translate(title, summary)
-            if tr:
-                title, summary = tr
-                storage.set_translation(item["link"], title, summary)
-    icon = "💬 " if item["source_kind"] == "telegram" else ""
-    parts = [f"{icon}<b>{html.escape(title)}</b>"]
-    if summary:
-        parts.append(html.escape(sources.short(summary, 400)))
-    parts.append(f'<a href="{html.escape(item["link"])}">{html.escape(item["source_name"])} →</a>')
-    return "\n\n".join(parts)
+            current += "\n\n" + e
+    messages.append(current)
+    return messages
 
 
 def today() -> str:
@@ -218,15 +234,15 @@ async def send_digest(bot, chat_id: int, on_demand: bool = False) -> int:
     items = storage.items_for_user(chat_id, now - NEW_WINDOW, "digest", DIGEST_LIMIT)
     if not items:
         return 0
-    header = (f"🎨 <b>Дизайн-дайджест · {today()}</b>\n\nСвежее из твоих источников: {len(items)}."
-              if not on_demand else f"Свежее из твоих источников: {len(items)} 👇")
-    await bot.send_message(chat_id, header, parse_mode=ParseMode.HTML)
-    sent = []
-    for item in reversed(items):  # от старых к новым
-        text = await asyncio.to_thread(render, item)
-        await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
-        sent.append(item["link"])
+    items = list(reversed(items))  # от старых к новым
+    header = (f"🎨 <b>Дизайн-дайджест · {today()}</b>\nСвежее из твоих источников: {len(items)}"
+              if not on_demand else f"🎨 <b>Свежее из твоих источников: {len(items)}</b>")
+    ready = await asyncio.to_thread(prepare, items)
+    entries = [entry(i, *ready[i["link"]]) for i in items]
+    for text in pack(header, entries):
+        await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW)
         await asyncio.sleep(0.1)
+    sent = [i["link"] for i in items]
     storage.mark_delivered(chat_id, sent, "digest")
     return len(sent)
 
@@ -242,7 +258,7 @@ async def send_recap(bot, chat_id: int) -> None:
     for i in items:
         title = i["ru_title"] or i["title"]
         icon = {"youtube": "🎬 ", "telegram": "💬 "}.get(i["source_kind"], "")
-        lines.append(f'• {icon}<a href="{html.escape(i["link"])}">{html.escape(title)}</a>'
+        lines.append(f'• {icon}<a href="{html.escape(i["link"])}"><b>{html.escape(title)}</b></a>'
                      f' — {html.escape(i["source_name"])}')
     await bot.send_message(
         chat_id,
