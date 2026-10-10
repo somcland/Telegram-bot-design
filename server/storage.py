@@ -77,6 +77,8 @@ def init() -> None:
             c.execute("ALTER TABLE users ADD COLUMN tz TEXT DEFAULT 'Europe/Moscow'")
         if "last_sent" not in cols:
             c.execute("ALTER TABLE users ADD COLUMN last_sent TEXT")
+        if "scrape" not in {r[1] for r in c.execute("PRAGMA table_info(sources)")}:
+            c.execute("ALTER TABLE sources ADD COLUMN scrape TEXT")
         c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         row = c.execute("SELECT value FROM meta WHERE key='highlight'").fetchone()
         if not row or row[0] != HIGHLIGHT_VERSION:  # формат хайлайтов поменялся — пересчитать
@@ -84,13 +86,13 @@ def init() -> None:
             c.execute("INSERT OR REPLACE INTO meta VALUES ('highlight', ?)", (HIGHLIGHT_VERSION,))
         for s in json.loads(CATALOG.read_text(encoding="utf-8"))["sources"]:
             c.execute(
-                """INSERT INTO sources (id, kind, name, url, lang, filter, builtin, is_default)
-                   VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                """INSERT INTO sources (id, kind, name, url, lang, filter, builtin, is_default, scrape)
+                   VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, name=excluded.name,
-                     url=excluded.url, lang=excluded.lang, filter=excluded.filter,
+                     url=excluded.url, lang=excluded.lang, filter=excluded.filter, scrape=excluded.scrape,
                      builtin=1, is_default=excluded.is_default""",
                 (s["id"], s["kind"], s["name"], s["url"], s.get("lang", "ru"),
-                 int(s.get("filter", False)), int(s.get("default", False))),
+                 int(s.get("filter", False)), int(s.get("default", False)), s.get("scrape")),
             )
 
 
@@ -189,6 +191,11 @@ def sources_by_ids(ids: list[str]) -> list[sqlite3.Row]:
 
 
 # ---------- материалы ----------
+
+def known_links(source_id: str) -> set[str]:
+    with connect() as c:
+        return {r[0] for r in c.execute("SELECT link FROM items WHERE source_id=?", (source_id,))}
+
 
 def save_items(source_id: str, items: list[dict]) -> int:
     now = time.time()

@@ -231,7 +231,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def refresh(srcs) -> None:
     for s in srcs:
+        first_time = not storage.known_links(s["id"])
         items = sources.fetch(s)
+        if first_time and "scrape" in s.keys() and s["scrape"]:
+            # у сайта без RSS нет дат: всё, что было до подключения, — не «свежее»
+            for i in items:
+                i["ts"] = i["ts"] or time.time() - NEW_WINDOW - 3600
         added = storage.save_items(s["id"], items)
         if added:
             log.info("%s: +%d", s["name"], added)

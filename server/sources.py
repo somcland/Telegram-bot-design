@@ -57,10 +57,50 @@ def fetch(source) -> list[dict]:
             return fetch_youtube(source)
         if kind == "telegram":
             return fetch_telegram(source)
+        if "scrape" in source.keys() and source["scrape"]:
+            from . import storage
+            return fetch_page(source, storage.known_links(source["id"]))
         return fetch_rss(source)
     except Exception as e:
         print(f"[!] {source['name']}: {e}", file=sys.stderr)
         return []
+
+
+def fetch_page(source, known: set[str], max_new: int = 10) -> list[dict]:
+    """Сайт без RSS: ссылки на статьи по шаблону адреса, анонс — из описания страницы статьи."""
+    page = _get(source["url"])
+    soup = BeautifulSoup(page.text, "html.parser")
+    rx = re.compile(source["scrape"])
+    found: dict[str, str] = {}
+    for a in soup.find_all("a", href=True):
+        link = clean_url(urljoin(page.url, a["href"]))
+        if rx.match(link):
+            text = a.get_text(" ", strip=True)
+            if len(text) > len(found.get(link, "")):
+                found[link] = text
+    items, fetched = [], 0
+    for link, title in found.items():
+        item = {"link": link, "title": short(title, 160), "summary": "", "ts": 0}
+        if link not in known and fetched < max_new:  # анонс берём только у новых статей
+            fetched += 1
+            try:
+                art = BeautifulSoup(_get(link).text, "html.parser")
+                og = art.find("meta", property="og:title")
+                desc = art.find("meta", property="og:description") or art.find("meta", attrs={"name": "description"})
+                if og and og.get("content"):
+                    item["title"] = short(og["content"], 160)
+                item["summary"] = short(desc.get("content", "") if desc else "", 400)
+                pub = art.find("meta", property="article:published_time")
+                if pub and pub.get("content"):
+                    from datetime import datetime
+                    item["ts"] = datetime.fromisoformat(pub["content"].replace("Z", "+00:00")).timestamp()
+            except Exception:
+                pass
+        elif link not in known:
+            continue  # остальные новые подтянем в следующий раз
+        if item["title"]:
+            items.append(item)
+    return items
 
 
 def fetch_rss(source) -> list[dict]:
