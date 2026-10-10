@@ -221,12 +221,18 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await q.edit_message_text("Твои источники 👇", reply_markup=settings_keyboard(chat_id))
     elif data == "more":
         await q.answer()
+        # убираем прошлую порцию, чтобы в чате оставалась только новая
+        old = set(LAST_BATCH.pop(chat_id, [])) | {q.message.message_id}
         try:
-            await q.edit_message_reply_markup(None)  # убираем кнопку со старого сообщения
-        except TelegramError:
-            pass
-        if not await send_batch(ctx.bot, chat_id):
-            await q.message.reply_text("Больше свежего нет 🙂")
+            await ctx.bot.delete_messages(chat_id, sorted(old))
+        except TelegramError as e:  # старше 48 часов Telegram удалять не даёт
+            log.info("не удалил прошлую порцию: %s", e)
+            try:
+                await q.edit_message_reply_markup(None)
+            except TelegramError:
+                pass
+        if not await send_batch(ctx.bot, chat_id, "🎨 <b>Продолжение · свежего осталось: {total}</b>"):
+            await ctx.bot.send_message(chat_id, "Больше свежего нет 🙂")
     elif data == "back":
         await q.answer()
         await q.edit_message_text("Твои источники 👇", reply_markup=settings_keyboard(chat_id))
@@ -369,6 +375,9 @@ def today() -> str:
     return f"{d.day} {MONTHS[d.month - 1]}"
 
 
+LAST_BATCH: dict[int, list[int]] = {}  # chat_id → id сообщений последней порции (для «Ещё»)
+
+
 async def send_batch(bot, chat_id: int, header: str = "") -> int:
     """Очередная порция свежего: N штук, остальное — по кнопке «Ещё»."""
     images, batch = display(chat_id)
@@ -383,16 +392,19 @@ async def send_batch(bot, chat_id: int, header: str = "") -> int:
     more = InlineKeyboardMarkup([[InlineKeyboardButton(f"Ещё {min(rest, batch)} из {rest} →",
                                                        callback_data="more")]]) if rest > 0 else None
 
+    ids: list[int] = []
     if not images:
         texts = pack(header, [entry(i, *ready[i["link"]]) for i in items])
         for n, text in enumerate(texts):
-            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
-                                   reply_markup=more if n == len(texts) - 1 else None)
+            m = await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
+                                       reply_markup=more if n == len(texts) - 1 else None)
+            ids.append(m.message_id)
             await asyncio.sleep(0.1)
     else:
         photos = await asyncio.to_thread(collect_photos, items)
-        if not await send_rich(bot, chat_id, header, items, ready, photos, more):
-            await send_separately(bot, chat_id, header, items, ready, photos, more)
+        if not await send_rich(bot, chat_id, header, items, ready, photos, more, ids):
+            await send_separately(bot, chat_id, header, items, ready, photos, more, ids)
+    LAST_BATCH[chat_id] = ids
     storage.mark_delivered(chat_id, [i["link"] for i in items], "digest")
     return len(items)
 
@@ -441,7 +453,7 @@ def _rich_request(token: str, chat_id: int, html_text: str, photos, items, uploa
     return r.json()
 
 
-async def send_rich(bot, chat_id: int, header: str, items, ready, photos, more) -> bool:
+async def send_rich(bot, chat_id: int, header: str, items, ready, photos, more, ids: list) -> bool:
     """Всё одним сообщением-статьёй (Bot API 10.1+). Сначала картинки файлами, потом ссылками."""
     for uploaded in ([True, False] if photos else [False]):
         html_text = rich_html(header, items, ready, photos, uploaded)
@@ -452,8 +464,10 @@ async def send_rich(bot, chat_id: int, header: str, items, ready, photos, more) 
             log.warning("статья не отправилась: %s", e)
             continue
         if res.get("ok"):
+            ids.append(res["result"]["message_id"])
             if more and not res["result"].get("reply_markup"):  # кнопку к статье не прикрепили
-                await bot.send_message(chat_id, "Это не всё 👇", reply_markup=more)
+                m = await bot.send_message(chat_id, "Это не всё 👇", reply_markup=more)
+                ids.append(m.message_id)
             return True
         if res.get("error_code") == 403:
             raise Forbidden(res.get("description", ""))
@@ -462,7 +476,7 @@ async def send_rich(bot, chat_id: int, header: str, items, ready, photos, more) 
     return False
 
 
-async def send_separately(bot, chat_id: int, header: str, items, ready, photos, more) -> None:
+async def send_separately(bot, chat_id: int, header: str, items, ready, photos, more, ids: list) -> None:
     """Запасной вариант: каждый материал своим сообщением с картинкой."""
     for n, i in enumerate(items):
         title, text = ready[i["link"]]
@@ -471,16 +485,18 @@ async def send_separately(bot, chat_id: int, header: str, items, ready, photos, 
         head = f"{header}\n\n" if header and n == 0 else ""
         if i["link"] in photos and len(head + body) <= 1024:
             try:
-                await bot.send_photo(chat_id, photos[i["link"]][1], caption=head + body,
-                                     parse_mode=ParseMode.HTML, reply_markup=markup)
+                m = await bot.send_photo(chat_id, photos[i["link"]][1], caption=head + body,
+                                         parse_mode=ParseMode.HTML, reply_markup=markup)
+                ids.append(m.message_id)
                 await asyncio.sleep(0.1)
                 continue
             except Forbidden:
                 raise
             except TelegramError as e:
                 log.info("картинка не отправилась (%s): %s", i["link"], e)
-        await bot.send_message(chat_id, head + body, parse_mode=ParseMode.HTML,
-                               link_preview_options=NO_PREVIEW, reply_markup=markup)
+        m = await bot.send_message(chat_id, head + body, parse_mode=ParseMode.HTML,
+                                   link_preview_options=NO_PREVIEW, reply_markup=markup)
+        ids.append(m.message_id)
         await asyncio.sleep(0.1)
 
 
