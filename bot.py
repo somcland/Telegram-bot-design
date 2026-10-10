@@ -133,6 +133,9 @@ def format_message(item: dict) -> str:
     return "\n\n".join(parts)
 
 
+STATS = {"ok": 0, "fail": 0}
+
+
 def send(text: str) -> bool:
     if DRY_RUN:
         print("-" * 60)
@@ -149,8 +152,10 @@ def send(text: str) -> bool:
             time.sleep(wait + 1)
             continue
         if r.ok:
+            STATS["ok"] += 1
             return True
         print(f"::warning::Telegram {r.status_code}: {r.text}")
+        STATS["fail"] += 1
         return False
     return False
 
@@ -270,6 +275,10 @@ def main() -> None:
         send_weekly_recap(cfg, matched, all_videos)
 
     save_seen(seen_list)
+    if STATS["fail"] and not STATS["ok"]:
+        # ни одно сообщение не дошло — красный крестик в Actions и письмо от GitHub
+        print(f"::error::Telegram не принял ни одного сообщения. Проверь TELEGRAM_CHAT_ID и что бот добавлен в чат/канал.")
+        sys.exit(1)
     print(f"::notice::Найдено новых: {len(fresh)}, отправлено: {sent}, видео: {videos_sent}")
 
 
@@ -304,12 +313,15 @@ def send_weekly_recap(cfg: dict, articles: list[dict], videos: list[dict]) -> No
     today = time.strftime("%Y-%m-%d", msk)
     if state.get("quiet_day") == today:  # за сегодня уже писали — второй раз не надо
         return
-    state["quiet_day"] = today
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=0), encoding="utf-8")
+
+    def remember_quiet_day():
+        state["quiet_day"] = today
+        STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=0), encoding="utf-8")
 
     if not picks:
-        send(f"🎨 <b>Дизайн-дайджест · {date}</b>\n\n"
-             f"Сегодня новостей о дизайне нет, а главное за неделю уже было. Загляну завтра.")
+        if send(f"🎨 <b>Дизайн-дайджест · {date}</b>\n\n"
+                f"Сегодня новостей о дизайне нет, а главное за неделю уже было. Загляну завтра."):
+            remember_quiet_day()
         return
 
     lines = [
@@ -325,7 +337,7 @@ def send_weekly_recap(cfg: dict, articles: list[dict], videos: list[dict]) -> No
     if send("\n\n".join(lines[:2]) + "\n\n" + "\n".join(lines[2:])):
         keep = [l for l in state.get("recapped", []) if l in week_links]  # старше недели — забываем
         state["recapped"] = keep + [i["link"] for i in picks]
-        STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=0), encoding="utf-8")
+        remember_quiet_day()
     print(f"::notice::Итоги недели: {len(picks)} материалов")
 
 
