@@ -206,22 +206,20 @@ def main() -> None:
     seen_list = seen_list or []
     seen = set(seen_list)
 
-    # собираем всё и отбираем новое про дизайн
-    fresh = []
+    # собираем всё про дизайн (и старое — пригодится для итогов недели)
+    matched = []
     for feed in cfg["feeds"]:
         for item in fetch_feed(feed):
-            if item["link"] in seen:
-                continue
             text = f'{item["title"]} {item["summary"]} {item["tags"]}'
             if is_stop(text):
                 continue
             if item["filter"] and not is_design(text):
                 continue
-            fresh.append(item)
+            matched.append(item)
 
-    # без дублей между лентами, от старых к новым
-    uniq = {i["link"]: i for i in fresh}
-    fresh = sorted(uniq.values(), key=lambda i: i["ts"])
+    # без дублей между лентами, от старых к новым; новое — то, чего ещё не слали
+    matched = sorted({i["link"]: i for i in matched}.values(), key=lambda i: i["ts"])
+    fresh = [i for i in matched if i["link"] not in seen]
 
     # первый запуск: не заваливаем чат архивом, шлём только последние N
     if first_run:
@@ -248,10 +246,12 @@ def main() -> None:
 
     # ---------- YouTube: только новые видео, без новых — молчим ----------
     videos_sent = 0
+    all_videos = []
     for channel in cfg.get("youtube", []):
         videos = youtube.fetch_channel(channel)
         if not videos:
             continue
+        all_videos.extend(videos)
         new = [v for v in videos if v["link"] not in seen]
         # канал проверяется впервые: запоминаем всё, что уже есть, ничего не шлём
         if len(new) == len(videos):
@@ -264,8 +264,68 @@ def main() -> None:
                 videos_sent += 1
                 time.sleep(1.2)
 
+    # ---------- тихий день: вместо тишины — главное за неделю ----------
+    if not first_run and sent == 0 and videos_sent == 0:
+        send_weekly_recap(cfg, matched, all_videos)
+
     save_seen(seen_list)
     print(f"Найдено новых: {len(fresh)}, отправлено: {sent}, видео: {videos_sent}")
+
+
+# ---------- итоги недели ----------
+
+STATE_PATH = ROOT / "state.json"
+WEEK = 7 * 24 * 3600
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def send_weekly_recap(cfg: dict, articles: list[dict], videos: list[dict]) -> None:
+    """Материалы за последние 7 дней, которые ещё не попадали в итоги.
+    Так два тихих дня подряд не повторяют одну и ту же подборку."""
+    state = load_state()
+    recapped = set(state.get("recapped", []))
+    now = time.time()
+    limit = cfg.get("recap_size", 7)
+
+    week = [i for i in articles + videos if i["ts"] and now - i["ts"] <= WEEK]
+    week_links = {i["link"] for i in week}
+    pool = [i for i in week if i["link"] not in recapped]
+    picks = sorted(pool, key=lambda i: i["ts"], reverse=True)[:limit]
+
+    msk = time.gmtime(now + 3 * 3600)
+    date = f"{msk.tm_mday} {MONTHS[msk.tm_mon - 1]}"
+    today = time.strftime("%Y-%m-%d", msk)
+    if state.get("quiet_day") == today:  # за сегодня уже писали — второй раз не надо
+        return
+    state["quiet_day"] = today
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=0), encoding="utf-8")
+
+    if not picks:
+        send(f"🎨 <b>Дизайн-дайджест · {date}</b>\n\n"
+             f"Сегодня новостей о дизайне нет, а главное за неделю уже было. Загляну завтра.")
+        return
+
+    lines = [
+        f"🎨 <b>Дизайн-дайджест · {date}</b>",
+        f"Свежих новостей сегодня нет — собрал главное за неделю:",
+    ]
+    for i in picks:
+        source = i.get("source") or i.get("channel", "")
+        icon = "🎬 " if "youtube.com" in i["link"] else ""
+        lines.append(f'• {icon}<a href="{html.escape(i["link"])}">{html.escape(i["title"])}</a>'
+                     f' — {html.escape(source)}')
+
+    if send("\n\n".join(lines[:2]) + "\n\n" + "\n".join(lines[2:])):
+        keep = [l for l in state.get("recapped", []) if l in week_links]  # старше недели — забываем
+        state["recapped"] = keep + [i["link"] for i in picks]
+        STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=0), encoding="utf-8")
+    print(f"Итоги недели: {len(picks)} материалов")
 
 
 if __name__ == "__main__":

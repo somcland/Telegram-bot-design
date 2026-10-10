@@ -38,5 +38,6 @@
   ],
 
   "max_posts_per_run": 30,
-  "first_run_send_last": 5
+  "first_run_send_last": 5,
+  "recap_size": 7
 }
