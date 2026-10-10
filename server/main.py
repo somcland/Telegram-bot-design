@@ -414,6 +414,8 @@ def rich_html(header: str, items, ready, photos, uploaded: bool) -> str:
     parts = [f"<p>{header.replace(chr(10), '<br/>')}</p>"] if header else []
     for n, i in enumerate(items):
         title, text = ready[i["link"]]
+        if n or header:
+            parts.append("<p><br/></p>")  # отступ перед следующим материалом
         parts.append(f"<p>{title_line(i, title)}</p>")
         if i["link"] in photos:
             src = f"tg://photo?id=p{n}" if uploaded else html.escape(photos[i["link"]][0])
