@@ -1,0 +1,29 @@
+{
+  "_comment": "Источники, которые бот предлагает в меню. default: true — включены у нового пользователя.",
+  "sources": [
+    {"id": "yt-dear-designers", "kind": "youtube", "name": "Дорогие дизайнеры",
+     "url": "UCmTQpuwQErng_s0hs_f6NFA", "lang": "ru", "default": true},
+    {"id": "yt-the-futur", "kind": "youtube", "name": "The Futur",
+     "url": "UC-b3c7kxa5vU-bnmaROgvog", "lang": "en"},
+    {"id": "yt-flux-academy", "kind": "youtube", "name": "Flux Academy",
+     "url": "UCN7dywl5wDxTu1RM3eJ_h9Q", "lang": "en"},
+
+    {"id": "rss-sostav", "kind": "rss", "name": "Sostav",
+     "url": "https://www.sostav.ru/rss", "lang": "ru", "filter": true, "default": true},
+    {"id": "rss-cossa", "kind": "rss", "name": "Cossa",
+     "url": "https://www.cossa.ru/rss/", "lang": "ru", "filter": true, "default": true},
+    {"id": "rss-habr-design", "kind": "rss", "name": "Хабр · Дизайн",
+     "url": "https://habr.com/ru/rss/hubs/design/articles/", "lang": "ru", "default": true},
+    {"id": "rss-creative-bloq", "kind": "rss", "name": "Creative Bloq 🇬🇧",
+     "url": "https://www.creativebloq.com/feeds/all", "lang": "en"},
+    {"id": "rss-sidebar", "kind": "rss", "name": "Sidebar 🇬🇧",
+     "url": "https://sidebar.io/feed.xml", "lang": "en"},
+
+    {"id": "tg-typetoday", "kind": "telegram", "name": "type.today",
+     "url": "typetoday", "lang": "ru"},
+    {"id": "tg-awdee", "kind": "telegram", "name": "Оди",
+     "url": "awdee", "lang": "ru"},
+    {"id": "tg-posterino", "kind": "telegram", "name": "Posterino",
+     "url": "posterino", "lang": "ru"}
+  ]
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=Design digest Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=bot
+WorkingDirectory=/home/bot/app
+EnvironmentFile=/home/bot/app/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/bot/app/.venv/bin/python -m server.main
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
