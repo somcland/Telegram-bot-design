@@ -86,6 +86,8 @@ def init() -> None:
         if "scrape" not in {r[1] for r in c.execute("PRAGMA table_info(sources)")}:
             c.execute("ALTER TABLE sources ADD COLUMN scrape TEXT")
         c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS events (chat_id INTEGER, kind TEXT, at REAL)")
+        c.execute("CREATE INDEX IF NOT EXISTS events_at ON events(at)")
         row = c.execute("SELECT value FROM meta WHERE key='highlight'").fetchone()
         if not row or row[0] != HIGHLIGHT_VERSION:  # формат хайлайтов поменялся — пересчитать
             c.execute("UPDATE items SET ru_title=NULL, ru_summary=NULL")
@@ -294,4 +296,48 @@ def stats() -> dict:
             "users": c.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0],
             "sources": c.execute("SELECT COUNT(*) FROM sources").fetchone()[0],
             "items": c.execute("SELECT COUNT(*) FROM items").fetchone()[0],
+        }
+
+
+# ---------- статистика ----------
+
+def log_event(chat_id: int, kind: str) -> None:
+    """start, settings, digest_cmd, more, toggle, add_source, stop, daily, recap"""
+    with connect() as c:
+        c.execute("INSERT INTO events (chat_id, kind, at) VALUES (?, ?, ?)", (chat_id, kind, time.time()))
+
+
+def admin_stats() -> dict:
+    now = time.time()
+    day, week, month = now - 86400, now - 7 * 86400, now - 30 * 86400
+    with connect() as c:
+        one = lambda q, *a: c.execute(q, a).fetchone()[0]
+        ev = lambda kind, since: one("SELECT COUNT(*) FROM events WHERE kind=? AND at>=?", kind, since)
+        return {
+            "active": one("SELECT COUNT(*) FROM users WHERE active=1"),
+            "total": one("SELECT COUNT(*) FROM users"),
+            "stopped": one("SELECT COUNT(*) FROM users WHERE active=0"),
+            "new_day": one("SELECT COUNT(*) FROM users WHERE created_at>=?", day),
+            "new_week": one("SELECT COUNT(*) FROM users WHERE created_at>=?", week),
+            "new_month": one("SELECT COUNT(*) FROM users WHERE created_at>=?", month),
+            "alive_week": one("SELECT COUNT(DISTINCT chat_id) FROM events WHERE at>=? "
+                              "AND kind NOT IN ('daily','recap')", week),
+            "stops_week": ev("stop", week),
+            "daily_day": ev("daily", day) + ev("recap", day),
+            "daily_week": ev("daily", week) + ev("recap", week),
+            "digest_cmd_week": ev("digest_cmd", week),
+            "more_week": ev("more", week),
+            "items_day": one("SELECT COUNT(*) FROM items WHERE fetched_at>=?", day),
+            "custom": one("SELECT COUNT(*) FROM sources WHERE builtin=0"),
+            "top_sources": c.execute(
+                """SELECT s.name, s.builtin, COUNT(*) n FROM subs
+                   JOIN sources s ON s.id=subs.source_id
+                   JOIN users u ON u.chat_id=subs.chat_id AND u.active=1
+                   GROUP BY s.id ORDER BY n DESC, s.name LIMIT 12""").fetchall(),
+            "hours": c.execute(
+                """SELECT COALESCE(hour, 10) h, COUNT(*) n FROM users WHERE active=1
+                   GROUP BY h ORDER BY n DESC LIMIT 5""").fetchall(),
+            "growth": c.execute(
+                """SELECT date(created_at, 'unixepoch', '+3 hours') d, COUNT(*) n FROM users
+                   WHERE created_at>=? GROUP BY d ORDER BY d""", (week,)).fetchall(),
         }

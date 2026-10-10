@@ -22,6 +22,7 @@ import time
 from zoneinfo import ZoneInfo
 
 import requests
+from telegram import BotCommandScopeChat
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, TelegramError
@@ -143,18 +144,21 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     new = storage.add_user(chat.id, update.effective_user.full_name if update.effective_user else "")
     await chat.send_message(WELCOME, parse_mode=ParseMode.HTML,
                             reply_markup=settings_keyboard(chat.id))
+    storage.log_event(chat.id, "start")
     if new:
         log.info("новый подписчик %s", chat.id)
 
 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     storage.add_user(update.effective_chat.id, update.effective_user.full_name)
+    storage.log_event(update.effective_chat.id, "settings")
     await update.effective_chat.send_message("Твои источники 👇",
                                              reply_markup=settings_keyboard(update.effective_chat.id))
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     storage.set_active(update.effective_chat.id, False)
+    storage.log_event(update.effective_chat.id, "stop")
     await update.effective_chat.send_message(
         "Ок, больше не присылаю. Захочешь вернуться — /start, настройки сохранятся.")
 
@@ -167,6 +171,7 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     storage.add_user(chat_id, update.effective_user.full_name)
+    storage.log_event(chat_id, "digest_cmd")
     await update.effective_chat.send_message("Собираю свежее из твоих источников… ⏳")
     srcs = storage.sources_by_ids(storage.user_source_ids(chat_id))
     await asyncio.to_thread(refresh, srcs)
@@ -182,6 +187,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if data == "noop":
         await q.answer()
     elif data.startswith("t:"):
+        storage.log_event(chat_id, "toggle")
         on = storage.toggle(chat_id, data[2:])
         await q.answer("Включил" if on else "Выключил")
         await q.edit_message_reply_markup(settings_keyboard(chat_id))
@@ -221,6 +227,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await q.edit_message_text("Твои источники 👇", reply_markup=settings_keyboard(chat_id))
     elif data == "more":
         await q.answer()
+        storage.log_event(chat_id, "more")
         # убираем прошлую порцию, чтобы в чате оставалась только новая
         old = set(LAST_BATCH.pop(chat_id, [])) | {q.message.message_id}
         try:
@@ -270,6 +277,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     ctx.user_data.pop("awaiting", None)
     sid = storage.add_custom_source(chat.id, kind, name, url, lang)
+    storage.log_event(chat.id, "add_source")
     await asyncio.to_thread(refresh, storage.sources_by_ids([sid]))
     await chat.send_message(f"Добавил «{html.escape(name)}» ✅", parse_mode=ParseMode.HTML,
                             reply_markup=settings_keyboard(chat.id))
@@ -556,8 +564,11 @@ async def job_send(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("рассылка: %d подписчиков", len(due))
     for chat_id, day in due:
         try:
-            if not await send_digest(ctx.bot, chat_id):
+            if await send_digest(ctx.bot, chat_id):
+                storage.log_event(chat_id, "daily")
+            else:
                 await send_recap(ctx.bot, chat_id)
+                storage.log_event(chat_id, "recap")
         except Forbidden:
             storage.set_active(chat_id, False)  # человек заблокировал бота
             log.info("%s заблокировал бота — отписал", chat_id)
@@ -575,6 +586,57 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("ошибка: %s", ctx.error, exc_info=ctx.error)
 
 
+# ---------- статистика для админа ----------
+
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+
+
+def format_stats(st: dict) -> str:
+    def bar(n, top):
+        return "▇" * max(1, round(8 * n / top)) if top else ""
+    lines = [
+        "📊 <b>Статистика бота</b>",
+        "",
+        f"👥 Подписчиков: <b>{st['active']}</b> (всего было {st['total']}, отписались {st['stopped']})",
+        f"📈 Новых: сегодня {st['new_day']} · за неделю {st['new_week']} · за месяц {st['new_month']}",
+        f"🔥 Заходили в бота за неделю: {st['alive_week']} чел.",
+        f"👋 Отписались за неделю: {st['stops_week']}",
+        "",
+        f"📬 Утренних подборок: за сутки {st['daily_day']} · за неделю {st['daily_week']}",
+        f"⚡ /digest за неделю: {st['digest_cmd_week']} · нажатий «Ещё»: {st['more_week']}",
+        f"🗞 Собрано материалов за сутки: {st['items_day']}",
+    ]
+    if st["growth"]:
+        top = max(n for _, n in st["growth"])
+        lines += ["", "<b>Новые подписчики по дням</b>"]
+        lines += [f"<code>{d[5:]}</code> {bar(n, top)} {n}" for d, n in st["growth"]]
+    if st["top_sources"]:
+        top = st["top_sources"][0]["n"]
+        lines += ["", "<b>Популярные источники</b>"]
+        lines += [f"{bar(r['n'], top)} {r['n']} · {html.escape(r['name'])}{'' if r['builtin'] else ' (свой)'}"
+                  for r in st["top_sources"]]
+    lines += ["", f"➕ Своих источников добавлено: {st['custom']}"]
+    if st["hours"]:
+        lines += ["🕙 Популярное время: " + ", ".join(f"{h}:00 — {n}" for h, n in st["hours"])]
+    return "\n".join(lines)
+
+
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not ADMIN_IDS:
+        await update.effective_chat.send_message(
+            f"Статистика пока закрыта для всех. Твой id: <code>{chat_id}</code>\n\n"
+            "Чтобы она открылась только тебе, впиши на сервере в /home/bot/app/.env строку\n"
+            f"<code>ADMIN_IDS={chat_id}</code>\nи перезапусти бота: <code>systemctl restart design-bot</code>",
+            parse_mode=ParseMode.HTML)
+        return
+    if chat_id not in ADMIN_IDS:
+        await update.effective_chat.send_message("Настроить источники — /settings, свежее прямо сейчас — /digest.")
+        return
+    st = await asyncio.to_thread(storage.admin_stats)
+    await update.effective_chat.send_message(format_stats(st), parse_mode=ParseMode.HTML)
+
+
 # ---------- запуск ----------
 
 async def post_init(app: Application) -> None:
@@ -583,6 +645,16 @@ async def post_init(app: Application) -> None:
         BotCommand("digest", "Свежее прямо сейчас"),
         BotCommand("stop", "Отписаться"),
     ])
+    for admin in ADMIN_IDS:  # админу в меню команд — ещё и /stats
+        try:
+            await app.bot.set_my_commands([
+                BotCommand("settings", "Выбрать источники"),
+                BotCommand("digest", "Свежее прямо сейчас"),
+                BotCommand("stats", "Статистика бота"),
+                BotCommand("stop", "Отписаться"),
+            ], scope=BotCommandScopeChat(admin))
+        except TelegramError as e:
+            log.warning("меню админа %s: %s", admin, e)
     await app.bot.set_my_description(
         "🎨 Дизайн-дайджест\n\nКаждый день в удобное тебе время — подборка из выбранных тобой "
         "источников: новости дизайна, статьи с переводом, новые видео с хайлайтами и посты "
@@ -602,6 +674,7 @@ def main() -> None:
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
     app.add_error_handler(on_error)
