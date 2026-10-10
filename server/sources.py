@@ -1,7 +1,10 @@
 """Сбор материалов из YouTube, RSS и публичных Telegram-каналов + разбор ссылок «добавить свой»."""
 
 import calendar
+import hashlib
 import html
+import threading
+import time
 import json
 import os
 import re
@@ -37,8 +40,21 @@ def _ts(entry) -> float:
     return float(calendar.timegm(t)) if t else 0.0
 
 
+_local = threading.local()
+
+
+def http() -> requests.Session:
+    """Своя сессия на поток: соединения с сайтами переиспользуются, без повторных рукопожатий."""
+    if not hasattr(_local, "s"):
+        _local.s = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        _local.s.mount("https://", adapter)
+        _local.s.mount("http://", adapter)
+    return _local.s
+
+
 def _get(url: str, **kw) -> requests.Response:
-    r = requests.get(url, headers=HEADERS, timeout=30, **kw)
+    r = http().get(url, headers=HEADERS, timeout=30, **kw)
     r.raise_for_status()
     return r
 
@@ -152,22 +168,49 @@ def og_image(soup, base: str) -> str:
     return _abs(tag.get("content", ""), base) if tag else ""
 
 
+IMG_CACHE = os.path.join(ROOT, "data", "img")
+
+
 def download_image(url: str, referer: str = "") -> bytes | None:
-    """Скачиваем картинку сами: Telegram часто не может забрать её по ссылке."""
+    """Скачиваем картинку сами: Telegram часто не может забрать её по ссылке.
+    Скачанное лежит на диске — каждая картинка качается один раз, а не для каждого подписчика."""
+    os.makedirs(IMG_CACHE, exist_ok=True)
+    path = os.path.join(IMG_CACHE, hashlib.sha1(url.encode()).hexdigest())
+    if os.path.exists(path):
+        data = open(path, "rb").read()
+        return data or None  # пустой файл = «картинки нет», не пробуем снова
+    data = None
     try:
-        r = requests.get(url, headers={**HEADERS, "Referer": referer or url}, timeout=20)
+        r = http().get(url, headers={**HEADERS, "Referer": referer or url}, timeout=20)
         r.raise_for_status()
-        if not r.headers.get("content-type", "").startswith("image/") or not 1000 < len(r.content) < 9_000_000:
-            return None
-        return r.content
+        if r.headers.get("content-type", "").startswith("image/") and 1000 < len(r.content) < 9_000_000:
+            data = r.content
     except Exception:
-        return None
+        pass
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data or b"")
+    os.replace(tmp, path)
+    return data
+
+
+def cleanup_images(days: int = 14) -> None:
+    edge = time.time() - days * 86400
+    if not os.path.isdir(IMG_CACHE):
+        return
+    for name in os.listdir(IMG_CACHE):
+        p = os.path.join(IMG_CACHE, name)
+        try:
+            if os.path.getmtime(p) < edge:
+                os.remove(p)
+        except OSError:
+            pass
 
 
 def page_image(link: str) -> str:
     """Картинка со страницы статьи (og:image) — если в ленте её не было."""
     try:
-        r = requests.get(link, headers=HEADERS, timeout=10)
+        r = http().get(link, headers=HEADERS, timeout=10)
         r.raise_for_status()
         return og_image(BeautifulSoup(r.text, "html.parser"), r.url)
     except Exception:

@@ -60,6 +60,7 @@ def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -68,6 +69,7 @@ HIGHLIGHT_VERSION = "1-sentence"
 
 def init() -> None:
     with connect() as c:
+        c.execute("PRAGMA journal_mode=WAL")  # чтение не ждёт записи — потоки не мешают друг другу
         c.executescript(SCHEMA)
         # миграции для уже работающей базы
         cols = {r[1] for r in c.execute("PRAGMA table_info(users)")}

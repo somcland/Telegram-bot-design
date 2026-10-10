@@ -18,7 +18,9 @@ import html
 import json
 import logging
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from zoneinfo import ZoneInfo
 
 import requests
@@ -285,17 +287,40 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- сбор и рассылка ----------
 
-def refresh(srcs) -> None:
-    for s in srcs:
-        first_time = not storage.known_links(s["id"])
+FETCH_WORKERS = 8                  # сколько источников собираем одновременно
+TG_LIMIT = threading.Semaphore(3)  # t.me не любит много запросов разом
+SEND_CONCURRENCY = 8               # скольким подписчикам шлём одновременно (лимит Telegram ~30 сообщений/с)
+
+
+def refresh_one(s) -> None:
+    first_time = not storage.known_links(s["id"])
+    if s["kind"] == "telegram":
+        with TG_LIMIT:
+            items = sources.fetch(s)
+    else:
         items = sources.fetch(s)
-        if first_time and "scrape" in s.keys() and s["scrape"]:
-            # у сайта без RSS нет дат: всё, что было до подключения, — не «свежее»
-            for i in items:
-                i["ts"] = i["ts"] or time.time() - NEW_WINDOW - 3600
-        added = storage.save_items(s["id"], items)
-        if added:
-            log.info("%s: +%d", s["name"], added)
+    if first_time and "scrape" in s.keys() and s["scrape"]:
+        # у сайта без RSS нет дат: всё, что было до подключения, — не «свежее»
+        for i in items:
+            i["ts"] = i["ts"] or time.time() - NEW_WINDOW - 3600
+    added = storage.save_items(s["id"], items)
+    if added:
+        log.info("%s: +%d", s["name"], added)
+
+
+def refresh(srcs) -> None:
+    """Все источники параллельно: время сбора ≈ самый медленный источник, а не сумма всех."""
+    srcs = list(srcs)
+    if len(srcs) <= 1:
+        for s in srcs:
+            refresh_one(s)
+        return
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        for f in [pool.submit(refresh_one, s) for s in srcs]:
+            try:
+                f.result()
+            except Exception as e:
+                log.warning("сбор источника упал: %s", e)
 
 
 def prepare(items) -> dict[str, tuple[str, str]]:
@@ -360,6 +385,8 @@ def image_candidates(item) -> list[str]:
     """Адреса картинки по порядку: что попробовать отправить."""
     img = item["image"] if "image" in item.keys() else None
     extra = json.loads(item["extra"] or "{}")
+    if img:  # уже выбрана раньше (в т.ч. обложка видео) — без лишних запросов
+        return [img]
     if item["source_kind"] == "youtube" and extra.get("id"):
         vid = extra["id"]
         hq = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
@@ -368,6 +395,7 @@ def image_candidates(item) -> list[str]:
             ok = requests.head(maxres, timeout=10).status_code == 200
         except Exception:
             ok = False
+        storage.set_image(item["link"], maxres if ok else hq)  # проверяем один раз на видео
         return [maxres, hq] if ok else [hq]
     if img:
         return [img]
@@ -559,27 +587,60 @@ async def job_send(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     due = due_users()
     if not due:
         return
+    started = time.time()
     ids = sorted({sid for chat_id, _ in due for sid in storage.user_source_ids(chat_id)})
     await asyncio.to_thread(refresh, storage.sources_by_ids(ids))
-    log.info("рассылка: %d подписчиков", len(due))
-    for chat_id, day in due:
-        try:
-            if await send_digest(ctx.bot, chat_id):
-                storage.log_event(chat_id, "daily")
-            else:
-                await send_recap(ctx.bot, chat_id)
-                storage.log_event(chat_id, "recap")
-        except Forbidden:
-            storage.set_active(chat_id, False)  # человек заблокировал бота
-            log.info("%s заблокировал бота — отписал", chat_id)
-        except TelegramError as e:
-            log.warning("не доставил %s: %s", chat_id, e)
-            continue
-        storage.set_last_sent(chat_id, day)
+    await asyncio.to_thread(warm_up, [chat_id for chat_id, _ in due])
+    log.info("рассылка: %d подписчиков (подготовка %.0f с)", len(due), time.time() - started)
+
+    gate = asyncio.Semaphore(SEND_CONCURRENCY)
+
+    async def deliver(chat_id: int, day: str) -> None:
+        async with gate:
+            try:
+                if await send_digest(ctx.bot, chat_id):
+                    storage.log_event(chat_id, "daily")
+                else:
+                    await send_recap(ctx.bot, chat_id)
+                    storage.log_event(chat_id, "recap")
+            except Forbidden:
+                storage.set_active(chat_id, False)  # человек заблокировал бота
+                log.info("%s заблокировал бота — отписал", chat_id)
+            except TelegramError as e:
+                log.warning("не доставил %s: %s", chat_id, e)
+                return
+            except Exception as e:
+                log.error("рассылка %s упала: %s", chat_id, e, exc_info=e)
+                return
+            storage.set_last_sent(chat_id, day)
+
+    await asyncio.gather(*(deliver(c, d) for c, d in due))
+    log.info("рассылка готова за %.0f с", time.time() - started)
+
+
+def warm_up(chat_ids: list[int]) -> None:
+    """Готовим всё общее заранее и один раз: хайлайты и картинки материалов,
+    которые уйдут хоть кому-то. Потом каждому подписчику остаётся только отправить."""
+    since = time.time() - NEW_WINDOW
+    pool: dict[str, object] = {}
+    with_images: dict[str, object] = {}
+    for chat_id in chat_ids:
+        images, batch = display(chat_id)
+        for i in storage.items_for_user(chat_id, since, "digest", batch):
+            pool[i["link"]] = i
+            if images:
+                with_images[i["link"]] = i
+    if not pool:
+        return
+    prepare(list(pool.values()))
+    if with_images:
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            list(ex.map(lambda i: collect_photos([i]), with_images.values()))
 
 
 async def job_cleanup(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     storage.cleanup()
+    await asyncio.to_thread(sources.cleanup_images)
 
 
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
