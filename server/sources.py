@@ -89,6 +89,7 @@ def fetch_page(source, known: set[str], max_new: int = 10) -> list[dict]:
                 desc = art.find("meta", property="og:description") or art.find("meta", attrs={"name": "description"})
                 if og and og.get("content"):
                     item["title"] = short(og["content"], 160)
+                item["image"] = og_image(art, link)
                 item["summary"] = short(desc.get("content", "") if desc else "", 400)
                 pub = art.find("meta", property="article:published_time")
                 if pub and pub.get("content"):
@@ -115,14 +116,57 @@ def fetch_rss(source) -> list[dict]:
         if is_stop(text) or (source["filter"] and not is_design(text)):
             continue
         items.append({"link": clean_url(e["link"]), "title": title,
-                      "summary": short(summary, 400), "ts": _ts(e)})
+                      "summary": short(summary, 400), "ts": _ts(e), "image": rss_image(e)})
     return items
+
+
+IMG_EXT = re.compile(r"\.(jpe?g|png|webp|gif)(\?|$)", re.I)
+
+
+def _abs(url: str, base: str) -> str:
+    url = (url or "").strip()
+    return urljoin(base, url) if url and not url.startswith("data:") else ""
+
+
+def rss_image(e) -> str:
+    """Картинка материала из ленты: media:content, media:thumbnail, вложение или первая <img>."""
+    base = e.get("link", "")
+    for m in e.get("media_content", []) or []:
+        if m.get("url") and (m.get("medium") == "image" or "image" in (m.get("type") or "")
+                             or IMG_EXT.search(m["url"])):
+            return _abs(m["url"], base)
+    for m in e.get("media_thumbnail", []) or []:
+        if m.get("url"):
+            return _abs(m["url"], base)
+    for l in e.get("links", []) or []:
+        if l.get("rel") == "enclosure" and "image" in (l.get("type") or ""):
+            return _abs(l.get("href"), base)
+    raw = " ".join([e.get("summary", "")] + [c.get("value", "") for c in e.get("content", []) or []])
+    m = re.search(r"<img[^>]+src=[\"']([^\"']+)", raw, re.I)
+    return _abs(m.group(1), base) if m else ""
+
+
+def og_image(soup, base: str) -> str:
+    tag = (soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "twitter:image"})
+           or soup.find("meta", property="twitter:image"))
+    return _abs(tag.get("content", ""), base) if tag else ""
+
+
+def page_image(link: str) -> str:
+    """Картинка со страницы статьи (og:image) — если в ленте её не было."""
+    try:
+        r = requests.get(link, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        return og_image(BeautifulSoup(r.text, "html.parser"), r.url)
+    except Exception:
+        return ""
 
 
 def fetch_youtube(source) -> list[dict]:
     videos = youtube.fetch_channel({"name": source["name"], "channel_id": source["url"]})
     return [{"link": v["link"], "title": v["title"], "summary": "",
-             "ts": v["ts"], "extra": {"id": v["id"], "description": v["description"][:5000]}}
+             "ts": v["ts"], "image": f"https://i.ytimg.com/vi/{v['id']}/maxresdefault.jpg",
+             "extra": {"id": v["id"], "description": v["description"][:5000]}}
             for v in videos]
 
 
@@ -142,8 +186,13 @@ def fetch_telegram(source) -> list[dict]:
         if t:
             from datetime import datetime
             ts = datetime.fromisoformat(t["datetime"]).timestamp()
+        image = ""
+        wrap = msg.select_one(".tgme_widget_message_photo_wrap, .tgme_widget_message_video_thumb")
+        if wrap:
+            m = re.search(r"url\(['\"]?([^'\")]+)", wrap.get("style", ""))
+            image = m.group(1) if m else ""
         items.append({"link": f"https://t.me/{msg['data-post']}", "title": short(lines[0], 120),
-                      "summary": short(" ".join(lines[1:]), 400), "ts": ts})
+                      "summary": short(" ".join(lines[1:]), 400), "ts": ts, "image": image})
     return items
 
 

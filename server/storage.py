@@ -77,6 +77,12 @@ def init() -> None:
             c.execute("ALTER TABLE users ADD COLUMN tz TEXT DEFAULT 'Europe/Moscow'")
         if "last_sent" not in cols:
             c.execute("ALTER TABLE users ADD COLUMN last_sent TEXT")
+        if "images" not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN images INTEGER DEFAULT 1")
+        if "per_batch" not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN per_batch INTEGER DEFAULT 3")
+        if "image" not in {r[1] for r in c.execute("PRAGMA table_info(items)")}:
+            c.execute("ALTER TABLE items ADD COLUMN image TEXT")
         if "scrape" not in {r[1] for r in c.execute("PRAGMA table_info(sources)")}:
             c.execute("ALTER TABLE sources ADD COLUMN scrape TEXT")
         c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -133,6 +139,14 @@ def set_schedule(chat_id: int, hour: int | None = None, tz: str | None = None) -
             c.execute("UPDATE users SET hour=? WHERE chat_id=?", (hour, chat_id))
         if tz is not None:
             c.execute("UPDATE users SET tz=? WHERE chat_id=?", (tz, chat_id))
+
+
+def set_display(chat_id: int, images: bool | None = None, per_batch: int | None = None) -> None:
+    with connect() as c:
+        if images is not None:
+            c.execute("UPDATE users SET images=? WHERE chat_id=?", (int(images), chat_id))
+        if per_batch is not None:
+            c.execute("UPDATE users SET per_batch=? WHERE chat_id=?", (per_batch, chat_id))
 
 
 def set_last_sent(chat_id: int, day: str) -> None:
@@ -203,11 +217,15 @@ def save_items(source_id: str, items: list[dict]) -> int:
     with connect() as c:
         for i in items:
             cur = c.execute(
-                """INSERT OR IGNORE INTO items (link, source_id, title, summary, extra, ts, fetched_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT OR IGNORE INTO items (link, source_id, title, summary, extra, ts, fetched_at, image)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (i["link"], source_id, i["title"], i.get("summary", ""),
-                 json.dumps(i.get("extra", {}), ensure_ascii=False), i.get("ts") or now, now))
+                 json.dumps(i.get("extra", {}), ensure_ascii=False), i.get("ts") or now, now,
+                 i.get("image")))
             added += cur.rowcount
+            if not cur.rowcount and i.get("image"):  # уже был, но без картинки — дописать
+                c.execute("UPDATE items SET image=? WHERE link=? AND (image IS NULL OR image='')",
+                          (i["image"], i["link"]))
     return added
 
 
@@ -228,6 +246,22 @@ def items_for_user(chat_id: int, since: float, kind: str, limit: int) -> list[sq
                  AND NOT EXISTS (SELECT 1 FROM delivered d
                                  WHERE d.chat_id=? AND d.link=i.link AND d.kind=?)
                ORDER BY i.ts DESC LIMIT ?""", (chat_id, since, chat_id, kind, limit)).fetchall()
+
+
+def count_for_user(chat_id: int, since: float, kind: str) -> int:
+    with connect() as c:
+        return c.execute(
+            """SELECT COUNT(*) FROM items i
+               JOIN subs ON subs.source_id=i.source_id AND subs.chat_id=?
+               WHERE i.ts >= ?
+                 AND NOT EXISTS (SELECT 1 FROM delivered d
+                                 WHERE d.chat_id=? AND d.link=i.link AND d.kind=?)""",
+            (chat_id, since, chat_id, kind)).fetchone()[0]
+
+
+def set_image(link: str, image: str) -> None:
+    with connect() as c:
+        c.execute("UPDATE items SET image=? WHERE link=?", (image, link))
 
 
 def latest_for_user(chat_id: int, limit: int) -> list[sqlite3.Row]:

@@ -2,7 +2,7 @@
 Дизайн-дайджест: персональный Telegram-бот.
 
 /start     — подписаться (включаются источники по умолчанию) и открыть настройки
-/settings  — выбрать источники и время рассылки, добавить свои
+/settings  — источники, время рассылки, картинки вкл/выкл, сколько материалов за раз
 /digest    — прислать свежее прямо сейчас
 /stop      — отписаться
 
@@ -15,11 +15,13 @@
 import asyncio
 import datetime as dt
 import html
+import json
 import logging
 import os
 import time
 from zoneinfo import ZoneInfo
 
+import requests
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, TelegramError
@@ -45,7 +47,8 @@ TIMEZONES = [
     ("Europe/Berlin", "Европа (Берлин)"), ("Asia/Bangkok", "Бангкок"),
 ]
 TZ_NAMES = dict(TIMEZONES)
-DIGEST_LIMIT = 15
+BATCH_OPTIONS = [3, 5, 10, 15]
+DEFAULT_BATCH = 3
 RECAP_LIMIT = 7
 NEW_WINDOW = 48 * 3600     # «новое» — не старше двух суток
 WEEK = 7 * 24 * 3600
@@ -103,8 +106,26 @@ def tz_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def display(chat_id: int) -> tuple[bool, int]:
+    """(показывать ли картинки, сколько материалов за раз)."""
+    u = storage.get_user(chat_id)
+    images = bool(u["images"]) if u and u["images"] is not None else True
+    batch = u["per_batch"] if u and u["per_batch"] else DEFAULT_BATCH
+    return images, batch
+
+
+def batch_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    cur = display(chat_id)[1]
+    btns = [InlineKeyboardButton(("✅ " if n == cur else "") + str(n), callback_data=f"n:{n}")
+            for n in BATCH_OPTIONS]
+    return InlineKeyboardMarkup([btns, [InlineKeyboardButton("← К источникам", callback_data="back")]])
+
+
 def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"🕙 Присылать в {when_label(chat_id)}", callback_data="time")]]
+    images, batch = display(chat_id)
+    rows = [[InlineKeyboardButton(f"🕙 Присылать в {when_label(chat_id)}", callback_data="time")],
+            [InlineKeyboardButton("🖼 Картинки: " + ("вкл" if images else "выкл"), callback_data="img"),
+             InlineKeyboardButton(f"📦 По {batch} за раз", callback_data="batch")]]
     srcs = storage.menu_sources(chat_id)
     for kind, (title, add_label, _) in KINDS.items():
         rows.append([InlineKeyboardButton(title, callback_data="noop")])
@@ -185,6 +206,27 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await q.answer(f"Часовой пояс: {TZ_NAMES.get(data[2:], data[2:])}")
         await q.edit_message_text("Во сколько присылать подборку? Время — по твоему часовому поясу.",
                                   reply_markup=time_keyboard(chat_id))
+    elif data == "img":
+        images = not display(chat_id)[0]
+        storage.set_display(chat_id, images=images)
+        await q.answer("Картинки включены" if images else "Без картинок")
+        await q.edit_message_reply_markup(settings_keyboard(chat_id))
+    elif data == "batch":
+        await q.answer()
+        await q.edit_message_text("Сколько материалов присылать за раз? Остальное — по кнопке «Ещё».",
+                                  reply_markup=batch_keyboard(chat_id))
+    elif data.startswith("n:"):
+        storage.set_display(chat_id, per_batch=int(data[2:]))
+        await q.answer(f"По {data[2:]} за раз")
+        await q.edit_message_text("Твои источники 👇", reply_markup=settings_keyboard(chat_id))
+    elif data == "more":
+        await q.answer()
+        try:
+            await q.edit_message_reply_markup(None)  # убираем кнопку со старого сообщения
+        except TelegramError:
+            pass
+        if not await send_batch(ctx.bot, chat_id):
+            await q.message.reply_text("Больше свежего нет 🙂")
     elif data == "back":
         await q.answer()
         await q.edit_message_text("Твои источники 👇", reply_markup=settings_keyboard(chat_id))
@@ -268,25 +310,58 @@ def prepare(items) -> dict[str, tuple[str, str]]:
 ICONS = {"youtube": "🎬 ", "telegram": "💬 "}
 
 
+def title_line(item, title: str) -> str:
+    return f"{ICONS.get(item['source_kind'], '')}<b>{html.escape(title)}</b>"
+
+
+def link_line(item) -> str:
+    return f'<a href="{html.escape(item["link"])}">{html.escape(item["source_name"])} →</a>'
+
+
 def entry(item, title: str, text: str) -> str:
-    link = html.escape(item["link"])
-    out = f"{ICONS.get(item['source_kind'], '')}<b>{html.escape(title)}</b>"
+    out = title_line(item, title)
     if text:
         out += "\n" + html.escape(text)
-    return out + f'\n<a href="{link}">{html.escape(item["source_name"])} →</a>'
+    return out + "\n" + link_line(item)
+
+
+def caption(item, text: str) -> str:
+    return (html.escape(text) + "\n" if text else "") + link_line(item)
 
 
 def pack(header: str, entries: list[str], limit: int = 4000) -> list[str]:
     """Всё одним сообщением; если не влезает в лимит Telegram — продолжение следующим."""
     messages, current = [], header
     for e in entries:
-        if len(current) + 2 + len(e) > limit:
+        if current and len(current) + 2 + len(e) > limit:
             messages.append(current)
             current = e
         else:
-            current += "\n\n" + e
+            current = f"{current}\n\n{e}" if current else e
     messages.append(current)
     return messages
+
+
+def image_candidates(item) -> list[str]:
+    """Адреса картинки по порядку: что попробовать отправить."""
+    img = item["image"] if "image" in item.keys() else None
+    extra = json.loads(item["extra"] or "{}")
+    if item["source_kind"] == "youtube" and extra.get("id"):
+        vid = extra["id"]
+        hq = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+        maxres = f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg"
+        try:  # у старых видео нет обложки в высоком качестве — YouTube отдаёт заглушку с 404
+            ok = requests.head(maxres, timeout=10).status_code == 200
+        except Exception:
+            ok = False
+        return [maxres, hq] if ok else [hq]
+    if img:
+        return [img]
+    if img is None and item["source_kind"] == "rss":  # в ленте не было — ищем на странице статьи
+        found = sources.page_image(item["link"])
+        storage.set_image(item["link"], found)  # пустая строка = «искали, нет»
+        return [found] if found else []
+    return []
 
 
 def today() -> str:
@@ -294,22 +369,61 @@ def today() -> str:
     return f"{d.day} {MONTHS[d.month - 1]}"
 
 
-async def send_digest(bot, chat_id: int, on_demand: bool = False) -> int:
-    now = time.time()
-    items = storage.items_for_user(chat_id, now - NEW_WINDOW, "digest", DIGEST_LIMIT)
+async def send_batch(bot, chat_id: int, header: str = "") -> int:
+    """Очередная порция свежего: N штук, остальное — по кнопке «Ещё»."""
+    images, batch = display(chat_id)
+    since = time.time() - NEW_WINDOW
+    total = storage.count_for_user(chat_id, since, "digest")
+    items = storage.items_for_user(chat_id, since, "digest", batch)  # от новых к старым
     if not items:
         return 0
-    items = list(reversed(items))  # от старых к новым
-    header = (f"🎨 <b>Дизайн-дайджест · {today()}</b>\nСвежее из твоих источников: {len(items)}"
-              if not on_demand else f"🎨 <b>Свежее из твоих источников: {len(items)}</b>")
+    header = header.format(total=total)
     ready = await asyncio.to_thread(prepare, items)
-    entries = [entry(i, *ready[i["link"]]) for i in items]
-    for text in pack(header, entries):
-        await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW)
-        await asyncio.sleep(0.1)
-    sent = [i["link"] for i in items]
-    storage.mark_delivered(chat_id, sent, "digest")
-    return len(sent)
+    rest = total - len(items)
+    more = InlineKeyboardMarkup([[InlineKeyboardButton(f"Ещё {min(rest, batch)} из {rest} →",
+                                                       callback_data="more")]]) if rest > 0 else None
+
+    if not images:
+        texts = pack(header, [entry(i, *ready[i["link"]]) for i in items])
+        for n, text in enumerate(texts):
+            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
+                                   reply_markup=more if n == len(texts) - 1 else None)
+            await asyncio.sleep(0.1)
+    else:
+        for n, i in enumerate(items):
+            title, text = ready[i["link"]]
+            markup = more if n == len(items) - 1 else None
+            head = f"{header}\n\n" if header and n == 0 else ""
+            pics = await asyncio.to_thread(image_candidates, i)
+            sent = False
+            if pics:
+                await bot.send_message(chat_id, head + title_line(i, title), parse_mode=ParseMode.HTML,
+                                       link_preview_options=NO_PREVIEW)
+                for pic in pics:
+                    try:
+                        await bot.send_photo(chat_id, pic, caption=caption(i, text),
+                                             parse_mode=ParseMode.HTML, reply_markup=markup)
+                        sent = True
+                        break
+                    except Forbidden:
+                        raise
+                    except TelegramError as e:
+                        log.info("картинка не отправилась (%s): %s", pic, e)
+                if not sent:  # заголовок уже ушёл — досылаем текст без картинки
+                    await bot.send_message(chat_id, caption(i, text), parse_mode=ParseMode.HTML,
+                                           link_preview_options=NO_PREVIEW, reply_markup=markup)
+            else:
+                await bot.send_message(chat_id, head + entry(i, title, text), parse_mode=ParseMode.HTML,
+                                       link_preview_options=NO_PREVIEW, reply_markup=markup)
+            await asyncio.sleep(0.1)
+    storage.mark_delivered(chat_id, [i["link"] for i in items], "digest")
+    return len(items)
+
+
+async def send_digest(bot, chat_id: int, on_demand: bool = False) -> int:
+    header = ("🎨 <b>Свежее из твоих источников: {total}</b>" if on_demand
+              else f"🎨 <b>Дизайн-дайджест · {today()}</b>\nСвежее из твоих источников: {{total}}")
+    return await send_batch(bot, chat_id, header)
 
 
 async def send_recap(bot, chat_id: int) -> None:
