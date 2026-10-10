@@ -94,7 +94,7 @@ def fetch_feed(feed: dict) -> list[dict]:
         r = requests.get(feed["url"], headers=HEADERS, timeout=30)
         r.raise_for_status()
     except Exception as e:  # лента недоступна — пропускаем, остальные работают
-        print(f"[!] {feed['name']}: {e}", file=sys.stderr)
+        print(f"::warning::{feed['name']}: {e}")
         return []
 
     parsed = feedparser.parse(r.content)
@@ -113,6 +113,7 @@ def fetch_feed(feed: dict) -> list[dict]:
             "link": clean_url(link),
             "ts": time.mktime(e.published_parsed) if e.get("published_parsed") else 0,
         })
+    print(f"::notice::{feed['name']}: {len(items)} материалов в ленте")
     return items
 
 
@@ -149,7 +150,7 @@ def send(text: str) -> bool:
             continue
         if r.ok:
             return True
-        print(f"[!] Telegram {r.status_code}: {r.text}", file=sys.stderr)
+        print(f"::warning::Telegram {r.status_code}: {r.text}")
         return False
     return False
 
@@ -188,7 +189,7 @@ def update_bot_profile() -> None:
         try:
             requests.post(f"{base}/{method}", json=payload, timeout=30)
         except Exception as e:  # описание — не критично, рассылка важнее
-            print(f"[!] {method}: {e}", file=sys.stderr)
+            print(f"::warning::{method}: {e}")
 
 
 # ---------- основной цикл ----------
@@ -269,7 +270,7 @@ def main() -> None:
         send_weekly_recap(cfg, matched, all_videos)
 
     save_seen(seen_list)
-    print(f"Найдено новых: {len(fresh)}, отправлено: {sent}, видео: {videos_sent}")
+    print(f"::notice::Найдено новых: {len(fresh)}, отправлено: {sent}, видео: {videos_sent}")
 
 
 # ---------- итоги недели ----------
@@ -325,7 +326,7 @@ def send_weekly_recap(cfg: dict, articles: list[dict], videos: list[dict]) -> No
         keep = [l for l in state.get("recapped", []) if l in week_links]  # старше недели — забываем
         state["recapped"] = keep + [i["link"] for i in picks]
         STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=0), encoding="utf-8")
-    print(f"Итоги недели: {len(picks)} материалов")
+    print(f"::notice::Итоги недели: {len(picks)} материалов")
 
 
 if __name__ == "__main__":

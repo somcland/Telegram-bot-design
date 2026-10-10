@@ -33,7 +33,7 @@ def fetch_channel(channel: dict) -> list[dict]:
         r = requests.get(url, headers=HEADERS, timeout=30)
         r.raise_for_status()
     except Exception as e:
-        print(f"[!] YouTube {channel['name']}: {e}", file=sys.stderr)
+        print(f"::warning::YouTube {channel['name']}: {e}")
         return []
 
     videos = []
@@ -104,7 +104,7 @@ def ai_highlights(title: str, description: str, transcript: str) -> str:
         r.raise_for_status()
         return "".join(b.get("text", "") for b in r.json().get("content", [])).strip()
     except Exception as e:
-        print(f"[!] хайлайт через Claude не получился: {e}", file=sys.stderr)
+        print(f"::warning::хайлайт через Claude не получился: {e}")
         return ""
 
 
