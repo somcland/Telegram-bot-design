@@ -221,27 +221,34 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await q.edit_message_reply_markup(settings_keyboard(chat_id))
     elif data == "batch":
         await q.answer()
-        await q.edit_message_text("Сколько материалов присылать за раз? Остальное — по кнопке «Ещё».",
+        await q.edit_message_text("Сколько материалов на одной странице подборки? Остальное — листалкой ◀ ▶.",
                                   reply_markup=batch_keyboard(chat_id))
     elif data.startswith("n:"):
         storage.set_display(chat_id, per_batch=int(data[2:]))
         await q.answer(f"По {data[2:]} за раз")
         await q.edit_message_text("Твои источники 👇", reply_markup=settings_keyboard(chat_id))
-    elif data == "more":
+    elif data.startswith("pg:"):  # листалка выпуска: pg:<выпуск>:<страница>
+        _, issue_id, page = data.split(":")
+        issue = storage.get_issue(int(issue_id))
+        if not issue or issue["chat_id"] != chat_id:
+            await q.answer("Этот выпуск уже удалён — открой /archive", show_alert=True)
+            return
         await q.answer()
         storage.log_event(chat_id, "more")
-        # убираем прошлую порцию, чтобы в чате оставалась только новая
-        old = set(LAST_BATCH.pop(chat_id, [])) | {q.message.message_id}
-        try:
-            await ctx.bot.delete_messages(chat_id, sorted(old))
-        except TelegramError as e:  # старше 48 часов Telegram удалять не даёт
-            log.info("не удалил прошлую порцию: %s", e)
-            try:
-                await q.edit_message_reply_markup(None)
-            except TelegramError:
-                pass
-        if not await send_batch(ctx.bot, chat_id, "🎨 <b>Продолжение · свежего осталось: {total}</b>"):
-            await ctx.bot.send_message(chat_id, "Больше свежего нет 🙂")
+        await show_page(ctx.bot, chat_id, issue, int(page), from_message=q.message.message_id)
+    elif data.startswith("open:"):  # из архива
+        issue = storage.get_issue(int(data[5:]))
+        if not issue or issue["chat_id"] != chat_id:
+            await q.answer("Этот выпуск уже удалён", show_alert=True)
+            return
+        await q.answer()
+        storage.log_event(chat_id, "archive_open")
+        await show_page(ctx.bot, chat_id, issue, 0)
+    elif data == "arch":
+        await q.answer()
+        await send_archive(ctx.bot, chat_id)
+    elif data == "more":  # кнопка из старых подборок, до выпусков
+        await q.answer("Эта кнопка устарела — все подборки теперь в /archive", show_alert=True)
     elif data == "back":
         await q.answer()
         await q.edit_message_text("Твои источники 👇", reply_markup=settings_keyboard(chat_id))
@@ -411,23 +418,92 @@ def today() -> str:
     return f"{d.day} {MONTHS[d.month - 1]}"
 
 
-LAST_BATCH: dict[int, list[int]] = {}  # chat_id → id сообщений последней порции (для «Ещё»)
+ISSUE_MAX = 100  # больше материалов в один выпуск не кладём
 
 
-async def send_batch(bot, chat_id: int, header: str = "") -> int:
-    """Очередная порция свежего: N штук, остальное — по кнопке «Ещё»."""
-    images, batch = display(chat_id)
-    since = time.time() - NEW_WINDOW
-    total = storage.count_for_user(chat_id, since, "digest")
-    items = storage.items_for_user(chat_id, since, "digest", batch)  # от новых к старым
-    if not items:
-        return 0
-    header = header.format(total=total)
+def page_keyboard(issue_id: int, page: int, pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    if pages > 1:
+        nav = []
+        nav.append(InlineKeyboardButton("◀", callback_data=f"pg:{issue_id}:{page - 1}") if page > 0
+                   else InlineKeyboardButton(" ", callback_data="noop"))
+        nav.append(InlineKeyboardButton(f"{page + 1} / {pages}", callback_data="noop"))
+        nav.append(InlineKeyboardButton("▶", callback_data=f"pg:{issue_id}:{page + 1}") if page < pages - 1
+                   else InlineKeyboardButton("↺ В начало", callback_data=f"pg:{issue_id}:0"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("📚 Архив выпусков", callback_data="arch")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_page(bot, chat_id: int, issue, page: int, from_message: int | None = None) -> None:
+    """Показать страницу выпуска. Прошлую страницу этого выпуска заменяем — в чате остаётся одна."""
+    images, per = display(chat_id)
+    all_items = storage.items_by_links(json.loads(issue["links"]))
+    if not all_items:
+        await bot.send_message(chat_id, "Материалы этого выпуска уже удалены из базы.")
+        return
+    pages = (len(all_items) + per - 1) // per
+    page = max(0, min(page, pages - 1))
+    items = all_items[page * per:(page + 1) * per]
+    header = f"{issue['title']}\nВсего {len(all_items)}" + (f" · страница {page + 1} из {pages}" if pages > 1 else "")
     ready = await asyncio.to_thread(prepare, items)
-    rest = total - len(items)
-    more = InlineKeyboardMarkup([[InlineKeyboardButton(f"Ещё {min(rest, batch)} из {rest} →",
-                                                       callback_data="more")]]) if rest > 0 else None
+    markup = page_keyboard(issue["id"], page, pages)
+    old = set(json.loads(issue["msg_ids"] or "[]"))
+    if from_message:
+        old.add(from_message)
 
+    # без картинок и страница — одно сообщение: меняем текст на месте, без мигания
+    texts = pack(header, [entry(i, *ready[i["link"]]) for i in items]) if not images else []
+    if texts and len(texts) == 1 and from_message and old == {from_message}:
+        try:
+            await bot.edit_message_text(texts[0], chat_id=chat_id, message_id=from_message,
+                                        parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
+                                        reply_markup=markup)
+            storage.set_issue_view(issue["id"], page, [from_message])
+            return
+        except TelegramError as e:
+            log.info("не отредактировал страницу, пришлю новой: %s", e)
+
+    ids = await send_items(bot, chat_id, header, items, ready, images, markup)
+    storage.set_issue_view(issue["id"], page, ids)
+    old -= set(ids)
+    if old:
+        try:
+            await bot.delete_messages(chat_id, sorted(old))
+        except TelegramError as e:  # старше 48 часов Telegram удалять не даёт — просто убираем кнопки
+            log.info("не удалил прошлую страницу: %s", e)
+            for mid in old:
+                try:
+                    await bot.edit_message_reply_markup(chat_id=chat_id, message_id=mid, reply_markup=None)
+                except TelegramError:
+                    pass
+
+
+def user_tz(chat_id: int) -> ZoneInfo:
+    u = storage.get_user(chat_id)
+    try:
+        return ZoneInfo((u["tz"] if u else None) or "Europe/Moscow")
+    except Exception:
+        return MSK
+
+
+async def send_archive(bot, chat_id: int) -> None:
+    issues = storage.list_issues(chat_id)
+    if not issues:
+        await bot.send_message(chat_id, "Архив пока пуст — первый выпуск придёт по расписанию или по /digest.")
+        return
+    rows = []
+    for i in issues:
+        d = dt.datetime.fromtimestamp(i["created_at"], user_tz(chat_id))
+        n = len(json.loads(i["links"]))
+        rows.append([InlineKeyboardButton(f"{d.day} {MONTHS[d.month - 1]}, {d:%H:%M} · {n} мат.",
+                                          callback_data=f"open:{i['id']}")])
+    await bot.send_message(chat_id, f"📚 <b>Последние выпуски</b>\nХранятся {storage.ISSUE_DAYS} дней.",
+                           parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def send_items(bot, chat_id: int, header: str, items, ready, images: bool, more) -> list[int]:
+    """Отправить материалы страницы. Возвращает id отправленных сообщений."""
     ids: list[int] = []
     if not images:
         texts = pack(header, [entry(i, *ready[i["link"]]) for i in items])
@@ -440,9 +516,7 @@ async def send_batch(bot, chat_id: int, header: str = "") -> int:
         photos = await asyncio.to_thread(collect_photos, items)
         if not await send_rich(bot, chat_id, header, items, ready, photos, more, ids):
             await send_separately(bot, chat_id, header, items, ready, photos, more, ids)
-    LAST_BATCH[chat_id] = ids
-    storage.mark_delivered(chat_id, [i["link"] for i in items], "digest")
-    return len(items)
+    return ids
 
 
 def collect_photos(items) -> dict[str, tuple[str, bytes]]:
@@ -537,9 +611,21 @@ async def send_separately(bot, chat_id: int, header: str, items, ready, photos, 
 
 
 async def send_digest(bot, chat_id: int, on_demand: bool = False) -> int:
-    header = ("🎨 <b>Свежее из твоих источников: {total}</b>" if on_demand
-              else f"🎨 <b>Дизайн-дайджест · {today()}</b>\nСвежее из твоих источников: {{total}}")
-    return await send_batch(bot, chat_id, header)
+    """Новый выпуск: всё свежее разом фиксируем списком и показываем первую страницу.
+    Всё, что вошло в выпуск, считается отправленным — завтра не повторится, но останется в архиве."""
+    items = storage.items_for_user(chat_id, time.time() - NEW_WINDOW, "digest", ISSUE_MAX)  # от новых к старым
+    if not items:
+        return 0
+    links = [i["link"] for i in items]
+    now = dt.datetime.now(user_tz(chat_id))
+    title = (f"🎨 <b>Свежее · {now.day} {MONTHS[now.month - 1]}, {now:%H:%M}</b>" if on_demand
+             else f"🎨 <b>Дизайн-дайджест · {today()}</b>")
+    issue_id = storage.create_issue(chat_id, title, links)
+    storage.mark_delivered(chat_id, links, "digest")
+    await show_page(bot, chat_id, storage.get_issue(issue_id), 0)
+    # хайлайты для остальных страниц готовим заранее, чтобы листалось без задержек
+    asyncio.get_running_loop().run_in_executor(None, prepare, items)
+    return len(items)
 
 
 async def send_recap(bot, chat_id: int) -> None:
@@ -626,9 +712,9 @@ def warm_up(chat_ids: list[int]) -> None:
     with_images: dict[str, object] = {}
     for chat_id in chat_ids:
         images, batch = display(chat_id)
-        for i in storage.items_for_user(chat_id, since, "digest", batch):
+        for n, i in enumerate(storage.items_for_user(chat_id, since, "digest", ISSUE_MAX)):
             pool[i["link"]] = i
-            if images:
+            if images and n < batch:  # картинки нужны сразу только для первой страницы
                 with_images[i["link"]] = i
     if not pool:
         return
@@ -682,6 +768,11 @@ def format_stats(st: dict) -> str:
     return "\n".join(lines)
 
 
+async def cmd_archive(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    storage.add_user(update.effective_chat.id, update.effective_user.full_name)
+    await send_archive(ctx.bot, update.effective_chat.id)
+
+
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if not ADMIN_IDS:
@@ -704,6 +795,7 @@ async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("settings", "Выбрать источники"),
         BotCommand("digest", "Свежее прямо сейчас"),
+        BotCommand("archive", "Прошлые выпуски"),
         BotCommand("stop", "Отписаться"),
     ])
     for admin in ADMIN_IDS:  # админу в меню команд — ещё и /stats
@@ -711,6 +803,7 @@ async def post_init(app: Application) -> None:
             await app.bot.set_my_commands([
                 BotCommand("settings", "Выбрать источники"),
                 BotCommand("digest", "Свежее прямо сейчас"),
+                BotCommand("archive", "Прошлые выпуски"),
                 BotCommand("stats", "Статистика бота"),
                 BotCommand("stop", "Отписаться"),
             ], scope=BotCommandScopeChat(admin))
@@ -736,6 +829,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("archive", cmd_archive))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
     app.add_error_handler(on_error)

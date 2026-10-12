@@ -89,6 +89,10 @@ def init() -> None:
             c.execute("ALTER TABLE sources ADD COLUMN scrape TEXT")
         c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS events (chat_id INTEGER, kind TEXT, at REAL)")
+        c.execute("""CREATE TABLE IF NOT EXISTS issues (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, created_at REAL,
+            title TEXT, links TEXT, page INTEGER DEFAULT 0, msg_ids TEXT DEFAULT '[]')""")
+        c.execute("CREATE INDEX IF NOT EXISTS issues_chat ON issues(chat_id, created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS events_at ON events(at)")
         row = c.execute("SELECT value FROM meta WHERE key='highlight'").fetchone()
         if not row or row[0] != HIGHLIGHT_VERSION:  # формат хайлайтов поменялся — пересчитать
@@ -285,9 +289,51 @@ def mark_delivered(chat_id: int, links: list[str], kind: str) -> None:
                       [(chat_id, l, kind, now) for l in links])
 
 
+# ---------- выпуски (подборка с листалкой и архив) ----------
+
+ISSUE_DAYS = 30
+
+
+def create_issue(chat_id: int, title: str, links: list[str]) -> int:
+    with connect() as c:
+        cur = c.execute("INSERT INTO issues (chat_id, created_at, title, links) VALUES (?, ?, ?, ?)",
+                        (chat_id, time.time(), title, json.dumps(links)))
+        return cur.lastrowid
+
+
+def get_issue(issue_id: int) -> sqlite3.Row | None:
+    with connect() as c:
+        return c.execute("SELECT * FROM issues WHERE id=?", (issue_id,)).fetchone()
+
+
+def set_issue_view(issue_id: int, page: int, msg_ids: list[int]) -> None:
+    with connect() as c:
+        c.execute("UPDATE issues SET page=?, msg_ids=? WHERE id=?", (page, json.dumps(msg_ids), issue_id))
+
+
+def list_issues(chat_id: int, limit: int = 7) -> list[sqlite3.Row]:
+    with connect() as c:
+        return c.execute("SELECT * FROM issues WHERE chat_id=? ORDER BY created_at DESC LIMIT ?",
+                         (chat_id, limit)).fetchall()
+
+
+def items_by_links(links: list[str]) -> list[sqlite3.Row]:
+    """Материалы выпуска в его порядке (то, что уже удалено из базы, пропускаем)."""
+    if not links:
+        return []
+    with connect() as c:
+        q = ",".join("?" * len(links))
+        rows = c.execute(f"""SELECT i.*, s.name AS source_name, s.kind AS source_kind, s.lang AS lang
+                             FROM items i JOIN sources s ON s.id=i.source_id
+                             WHERE i.link IN ({q})""", links).fetchall()
+    by = {r["link"]: r for r in rows}
+    return [by[l] for l in links if l in by]
+
+
 def cleanup(days: int = 60) -> None:
     edge = time.time() - days * 86400
     with connect() as c:
+        c.execute("DELETE FROM issues WHERE created_at < ?", (time.time() - ISSUE_DAYS * 86400,))
         c.execute("DELETE FROM items WHERE fetched_at < ?", (edge,))
         c.execute("DELETE FROM delivered WHERE at < ?", (edge,))
 
