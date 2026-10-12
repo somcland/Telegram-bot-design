@@ -66,8 +66,12 @@ def short(text: str, n: int) -> str:
 
 # ---------- сбор ----------
 
+LAST_ERROR: dict[str, str] = {}  # id источника → последняя ошибка сбора (для админа)
+
+
 def fetch(source) -> list[dict]:
     kind = source["kind"]
+    LAST_ERROR.pop(source["id"], None)
     try:
         if kind == "youtube":
             return fetch_youtube(source)
@@ -79,6 +83,7 @@ def fetch(source) -> list[dict]:
         return fetch_rss(source)
     except Exception as e:
         print(f"[!] {source['name']}: {e}", file=sys.stderr)
+        LAST_ERROR[source["id"]] = f"{type(e).__name__}: {e}"[:200]
         return []
 
 

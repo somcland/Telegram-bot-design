@@ -85,8 +85,12 @@ def init() -> None:
             c.execute("ALTER TABLE users ADD COLUMN per_batch INTEGER DEFAULT 3")
         if "image" not in {r[1] for r in c.execute("PRAGMA table_info(items)")}:
             c.execute("ALTER TABLE items ADD COLUMN image TEXT")
-        if "scrape" not in {r[1] for r in c.execute("PRAGMA table_info(sources)")}:
+        src_cols = {r[1] for r in c.execute("PRAGMA table_info(sources)")}
+        if "scrape" not in src_cols:
             c.execute("ALTER TABLE sources ADD COLUMN scrape TEXT")
+        for col, typ in (("last_ok", "REAL"), ("last_error", "TEXT"), ("last_count", "INTEGER")):
+            if col not in src_cols:
+                c.execute(f"ALTER TABLE sources ADD COLUMN {col} {typ}")
         c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS events (chat_id INTEGER, kind TEXT, at REAL)")
         c.execute("""CREATE TABLE IF NOT EXISTS issues (
@@ -389,3 +393,27 @@ def admin_stats() -> dict:
                 """SELECT date(created_at, 'unixepoch', '+3 hours') d, COUNT(*) n FROM users
                    WHERE created_at>=? GROUP BY d ORDER BY d""", (week,)).fetchall(),
         }
+
+
+def set_source_status(source_id: str, count: int, error: str | None) -> None:
+    with connect() as c:
+        if error:
+            c.execute("UPDATE sources SET last_error=? WHERE id=?", (error, source_id))
+        else:
+            c.execute("UPDATE sources SET last_ok=?, last_error=NULL, last_count=? WHERE id=?",
+                      (time.time(), count, source_id))
+
+
+def admin_sources() -> list[sqlite3.Row]:
+    """Все источники: подписчики, свежесть, ошибки. Самые популярные — сверху."""
+    week = time.time() - 7 * 86400
+    with connect() as c:
+        return c.execute(
+            """SELECT s.*,
+                 (SELECT COUNT(*) FROM subs JOIN users u ON u.chat_id=subs.chat_id AND u.active=1
+                  WHERE subs.source_id=s.id) AS subscribers,
+                 (SELECT COUNT(*) FROM items i WHERE i.source_id=s.id AND i.ts>=?) AS week_items,
+                 (SELECT MAX(ts) FROM items i WHERE i.source_id=s.id) AS last_item,
+                 (SELECT name FROM users WHERE chat_id=s.added_by) AS author
+               FROM sources s
+               ORDER BY subscribers DESC, s.builtin DESC, s.name""", (week,)).fetchall()

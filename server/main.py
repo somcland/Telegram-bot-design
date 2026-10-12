@@ -311,6 +311,7 @@ def refresh_one(s) -> None:
         for i in items:
             i["ts"] = i["ts"] or time.time() - NEW_WINDOW - 3600
     added = storage.save_items(s["id"], items)
+    storage.set_source_status(s["id"], len(items), sources.LAST_ERROR.get(s["id"]))
     if added:
         log.info("%s: +%d", s["name"], added)
 
@@ -773,6 +774,72 @@ async def cmd_archive(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await send_archive(ctx.bot, update.effective_chat.id)
 
 
+KIND_ICONS = {"youtube": "📺", "rss": "📰", "telegram": "💬"}
+
+
+def ago(ts: float | None) -> str:
+    if not ts:
+        return "никогда"
+    h = (time.time() - ts) / 3600
+    if h < 1:
+        return "только что"
+    if h < 48:
+        return f"{int(h)} ч назад"
+    return f"{int(h // 24)} дн назад"
+
+
+def format_sources(rows) -> list[str]:
+    total_subs = max(1, len(storage.active_users()))
+    lines = ["🗂 <b>Все источники</b>",
+             "подписчики · материалов за неделю · последний материал", ""]
+    problems = []
+    for r in rows:
+        share = round(100 * r["subscribers"] / total_subs)
+        status = ""
+        if r["last_error"]:
+            status = " ❌"
+            problems.append(f"❌ <b>{html.escape(r['name'])}</b>: <code>{html.escape(r['last_error'][:120])}</code>")
+        elif r["last_ok"] and not r["last_count"]:
+            status = " ⚠️"
+            problems.append(f"⚠️ <b>{html.escape(r['name'])}</b>: открывается, но материалов не найдено")
+        elif r["subscribers"] and not r["week_items"]:
+            status = " 💤"
+        custom = ""
+        if not r["builtin"]:
+            who = html.escape(r["author"] or str(r["added_by"]))
+            custom = f"\n     ↳ свой, добавил {who}: <code>{html.escape(r['url'][:60])}</code>"
+        lines.append(f"{KIND_ICONS.get(r['kind'], '•')} <b>{html.escape(r['name'])}</b>{status} — "
+                     f"👥 {r['subscribers']} ({share}%) · 🗞 {r['week_items']} · {ago(r['last_item'])}{custom}")
+    lines += ["", "💤 — у подписчиков, но за неделю ничего не вышло"]
+    if problems:
+        lines += ["", "<b>Проблемы при последнем сборе</b>"] + problems
+    return _split(lines)
+
+
+def _split(lines: list[str], limit: int = 3900) -> list[str]:
+    out, cur = [], ""
+    for l in lines:
+        if len(cur) + len(l) + 1 > limit:
+            out.append(cur)
+            cur = ""
+        cur += l + "\n"
+    return out + [cur] if cur else out
+
+
+def is_admin(chat_id: int) -> bool:
+    return chat_id in ADMIN_IDS
+
+
+async def cmd_sources(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.effective_chat.send_message("Настроить источники — /settings, свежее прямо сейчас — /digest.")
+        return
+    rows = await asyncio.to_thread(storage.admin_sources)
+    for text in format_sources(rows):
+        await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW)
+
+
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if not ADMIN_IDS:
@@ -805,6 +872,7 @@ async def post_init(app: Application) -> None:
                 BotCommand("digest", "Свежее прямо сейчас"),
                 BotCommand("archive", "Прошлые выпуски"),
                 BotCommand("stats", "Статистика бота"),
+                BotCommand("sources", "Все источники и их популярность"),
                 BotCommand("stop", "Отписаться"),
             ], scope=BotCommandScopeChat(admin))
         except TelegramError as e:
@@ -829,6 +897,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("sources", cmd_sources))
     app.add_handler(CommandHandler("archive", cmd_archive))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
