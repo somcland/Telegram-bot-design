@@ -336,6 +336,43 @@ def resolve_telegram(text: str) -> tuple[str, str]:
 
 # ---------- перевод и хайлайты ----------
 
+def _gemini(prompt: str, max_tokens: int = 500) -> str:
+    """Gemini Flash: generateContent, а если его нет — новый Interactions API."""
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        return ""
+    model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+    headers = {"x-goog-api-key": key, "content-type": "application/json"}
+    base = "https://generativelanguage.googleapis.com/v1beta"
+    try:
+        r = http().post(f"{base}/models/{model}:generateContent", headers=headers, timeout=90, json={
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": max_tokens * 4, "temperature": 0.3}})
+        if r.status_code in (400, 404, 405):  # старый метод недоступен — пробуем новый
+            r = http().post(f"{base}/interactions", headers=headers, timeout=90, json={
+                "model": model, "input": prompt, "store": False})
+        r.raise_for_status()
+        data = r.json()
+        parts = [p.get("text", "") for c in data.get("candidates", [])
+                 for p in c.get("content", {}).get("parts", [])]
+        if not parts:  # ответ Interactions API
+            parts = [c.get("text", "") for s in data.get("steps", []) for c in s.get("content", [])
+                     if isinstance(c, dict)] or [data.get("output_text", "")]
+        return "".join(parts).strip()
+    except Exception as e:
+        print(f"[!] Gemini: {e}", file=sys.stderr)
+        return ""
+
+
+def llm(prompt: str, max_tokens: int = 500) -> str:
+    """Переводы и хайлайты: сначала Gemini Flash, если не вышло — Claude."""
+    return _gemini(prompt, max_tokens) or _claude(prompt, max_tokens)
+
+
+def has_llm() -> bool:
+    return bool(os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip())
+
+
 def _claude(prompt: str, max_tokens: int = 500) -> str:
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
@@ -394,7 +431,7 @@ def highlight_texts(items: list[dict]) -> dict[str, tuple[str, str]]:
         batch = items[start:start + 12]
         payload = [{"id": n, "title": i["title"], "text": (i.get("summary") or "")[:1500]}
                    for n, i in enumerate(batch)]
-        data = _json_from(_claude(
+        data = _json_from(llm(
             HIGHLIGHT_RULES + "\n\nДля каждого материала ниже ответь строго JSON-массивом "
             '[{"id": 0, "title": "...", "highlight": "..."}] без пояснений.\n\n'
             + json.dumps(payload, ensure_ascii=False), max_tokens=3000))
@@ -413,7 +450,7 @@ def highlight_video(item) -> tuple[str, str, bool]:
     extra = json.loads(item["extra"] or "{}")
     desc = extra.get("description", "")
     transcript = youtube.get_transcript(extra["id"])[:40000] if extra.get("id") else ""
-    data = _json_from(_claude(
+    data = _json_from(llm(
         HIGHLIGHT_RULES + ' Ответь строго JSON: {"title": "...", "highlight": "..."}.\n\n'
         f"Название видео: {item['title']}\n\nОписание:\n{desc[:4000]}\n\n"
         + (f"Субтитры:\n{transcript}" if transcript else "Субтитров нет."), max_tokens=600))

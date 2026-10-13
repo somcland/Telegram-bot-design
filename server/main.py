@@ -128,7 +128,9 @@ def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     images, batch = display(chat_id)
     rows = [[InlineKeyboardButton(f"🕙 Присылать в {when_label(chat_id)}", callback_data="time")],
             [InlineKeyboardButton("🖼 Картинки: " + ("вкл" if images else "выкл"), callback_data="img"),
-             InlineKeyboardButton(f"📦 По {batch} за раз", callback_data="batch")]]
+             InlineKeyboardButton(f"📦 По {batch} за раз", callback_data="batch")],
+            [InlineKeyboardButton("🌐 Перевод с английского: " + ("вкл" if storage.wants_translation(chat_id) else "выкл"),
+                                  callback_data="tr")]]
     srcs = storage.menu_sources(chat_id)
     for kind, (title, add_label, _) in KINDS.items():
         rows.append([InlineKeyboardButton(title, callback_data="noop")])
@@ -214,6 +216,11 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await q.answer(f"Часовой пояс: {TZ_NAMES.get(data[2:], data[2:])}")
         await q.edit_message_text("Во сколько присылать подборку? Время — по твоему часовому поясу.",
                                   reply_markup=time_keyboard(chat_id))
+    elif data == "tr":
+        on = not storage.wants_translation(chat_id)
+        storage.set_translate(chat_id, on)
+        await q.answer("Английские материалы — на русском" if on else "Английские материалы — в оригинале")
+        await q.edit_message_reply_markup(settings_keyboard(chat_id))
     elif data == "img":
         images = not display(chat_id)[0]
         storage.set_display(chat_id, images=images)
@@ -329,6 +336,20 @@ def refresh(srcs) -> None:
                 f.result()
             except Exception as e:
                 log.warning("сбор источника упал: %s", e)
+
+
+def untranslated(items, ready) -> dict[str, tuple[str, str]]:
+    """Перевод выключен: английские материалы — оригинальный заголовок и первое предложение анонса."""
+    out = dict(ready)
+    for i in items:
+        if i["lang"] == "en":
+            if i["source_kind"] == "youtube":
+                desc = json.loads(i["extra"] or "{}").get("description", "")
+                lines = [l for l in desc.splitlines() if l.strip() and "http" not in l]
+                out[i["link"]] = (i["title"], sources.few_sentences(" ".join(lines)))
+            else:
+                out[i["link"]] = (i["title"], sources.few_sentences(i["summary"] or ""))
+    return out
 
 
 def prepare(items) -> dict[str, tuple[str, str]]:
@@ -448,6 +469,8 @@ async def show_page(bot, chat_id: int, issue, page: int, from_message: int | Non
     items = all_items[page * per:(page + 1) * per]
     header = f"{issue['title']}\nВсего {len(all_items)}" + (f" · страница {page + 1} из {pages}" if pages > 1 else "")
     ready = await asyncio.to_thread(prepare, items)
+    if not storage.wants_translation(chat_id):
+        ready = untranslated(items, ready)
     markup = page_keyboard(issue["id"], page, pages)
     old = set(json.loads(issue["msg_ids"] or "[]"))
     if from_message:
@@ -625,11 +648,14 @@ async def send_digest(bot, chat_id: int, on_demand: bool = False) -> int:
     storage.mark_delivered(chat_id, links, "digest")
     await show_page(bot, chat_id, storage.get_issue(issue_id), 0)
     # хайлайты для остальных страниц готовим заранее, чтобы листалось без задержек
-    asyncio.get_running_loop().run_in_executor(None, prepare, items)
+    rest = items[display(chat_id)[1]:]  # первая страница уже готова
+    if rest:
+        asyncio.get_running_loop().run_in_executor(None, prepare, rest)
     return len(items)
 
 
 async def send_recap(bot, chat_id: int) -> None:
+    translate = storage.wants_translation(chat_id)
     items = storage.items_for_user(chat_id, time.time() - WEEK, "recap", RECAP_LIMIT)
     if not items:
         await bot.send_message(chat_id, f"🎨 <b>Дизайн-дайджест · {today()}</b>\n\n"
@@ -639,6 +665,8 @@ async def send_recap(bot, chat_id: int) -> None:
     lines = []
     for i in items:
         title = i["ru_title"] or i["title"]
+        if i["lang"] == "en" and not translate:
+            title = i["title"]
         icon = {"youtube": "🎬 ", "telegram": "💬 "}.get(i["source_kind"], "")
         lines.append(f'• {icon}<a href="{html.escape(i["link"])}"><b>{html.escape(title)}</b></a>'
                      f' — {html.escape(i["source_name"])}')

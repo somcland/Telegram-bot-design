@@ -81,6 +81,8 @@ def init() -> None:
             c.execute("ALTER TABLE users ADD COLUMN last_sent TEXT")
         if "images" not in cols:
             c.execute("ALTER TABLE users ADD COLUMN images INTEGER DEFAULT 1")
+        if "translate" not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN translate INTEGER DEFAULT 1")
         if "per_batch" not in cols:
             c.execute("ALTER TABLE users ADD COLUMN per_batch INTEGER DEFAULT 3")
         if "image" not in {r[1] for r in c.execute("PRAGMA table_info(items)")}:
@@ -159,6 +161,17 @@ def set_display(chat_id: int, images: bool | None = None, per_batch: int | None 
             c.execute("UPDATE users SET images=? WHERE chat_id=?", (int(images), chat_id))
         if per_batch is not None:
             c.execute("UPDATE users SET per_batch=? WHERE chat_id=?", (per_batch, chat_id))
+
+
+def set_translate(chat_id: int, on: bool) -> None:
+    with connect() as c:
+        c.execute("UPDATE users SET translate=? WHERE chat_id=?", (int(on), chat_id))
+
+
+def wants_translation(chat_id: int) -> bool:
+    with connect() as c:
+        row = c.execute("SELECT translate FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+    return bool(row["translate"]) if row and row["translate"] is not None else True
 
 
 def set_last_sent(chat_id: int, day: str) -> None:
