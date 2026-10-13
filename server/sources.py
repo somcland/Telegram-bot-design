@@ -336,6 +336,9 @@ def resolve_telegram(text: str) -> tuple[str, str]:
 
 # ---------- перевод и хайлайты ----------
 
+LAST_AI_ERROR: dict[str, str] = {}
+
+
 def _gemini(prompt: str, max_tokens: int = 500) -> str:
     """Gemini Flash: generateContent, а если его нет — новый Interactions API."""
     key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -351,7 +354,8 @@ def _gemini(prompt: str, max_tokens: int = 500) -> str:
         if r.status_code in (400, 404, 405):  # старый метод недоступен — пробуем новый
             r = http().post(f"{base}/interactions", headers=headers, timeout=90, json={
                 "model": model, "input": prompt, "store": False})
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
         data = r.json()
         parts = [p.get("text", "") for c in data.get("candidates", [])
                  for p in c.get("content", {}).get("parts", [])]
@@ -360,6 +364,7 @@ def _gemini(prompt: str, max_tokens: int = 500) -> str:
                      if isinstance(c, dict)] or [data.get("output_text", "")]
         return "".join(parts).strip()
     except Exception as e:
+        LAST_AI_ERROR["gemini"] = str(e)[:400]
         print(f"[!] Gemini: {e}", file=sys.stderr)
         return ""
 
@@ -460,3 +465,19 @@ def highlight_video(item) -> tuple[str, str, bool]:
     lines = [l for l in desc.splitlines()
              if l.strip() and "http" not in l and not youtube.TIMECODE.match(l)]
     return item["title"], few_sentences(" ".join(lines)), False
+
+
+def ai_check() -> str:
+    """Диагностика перевода для админа: ключи, модель и пробный запрос."""
+    def mask(v):
+        v = v.strip()
+        return f"есть ({v[:4]}…{v[-3:]}, {len(v)} симв.)" if v else "нет"
+    g = os.environ.get("GEMINI_API_KEY", "")
+    lines = [f"GEMINI_API_KEY: {mask(g)}",
+             f"Модель: {os.environ.get('GEMINI_MODEL', 'gemini-3.8-flash')}",
+             f"ANTHROPIC_API_KEY: {mask(os.environ.get('ANTHROPIC_API_KEY', ''))}"]
+    if g.strip():
+        LAST_AI_ERROR.pop("gemini", None)
+        out = _gemini("Переведи на русский одной строкой: Native page transitions on the web", 100)
+        lines.append(f"Ответ Gemini: {out!r}" if out else f"Ошибка Gemini: {LAST_AI_ERROR.get('gemini', 'пустой ответ')}")
+    return "\n".join(lines)

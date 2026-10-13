@@ -858,6 +858,17 @@ def is_admin(chat_id: int) -> bool:
     return chat_id in ADMIN_IDS
 
 
+async def cmd_aitest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.effective_chat.send_message("Настроить источники — /settings, свежее прямо сейчас — /digest.")
+        return
+    report = await asyncio.to_thread(sources.ai_check)
+    tr = "вкл" if storage.wants_translation(chat_id) else "выкл"
+    await update.effective_chat.send_message(f"🧪 <b>Проверка перевода</b>\nТвоя настройка перевода: {tr}\n\n"
+                                             f"<code>{html.escape(report)}</code>", parse_mode=ParseMode.HTML)
+
+
 async def cmd_sources(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
@@ -901,6 +912,7 @@ async def post_init(app: Application) -> None:
                 BotCommand("archive", "Прошлые выпуски"),
                 BotCommand("stats", "Статистика бота"),
                 BotCommand("sources", "Все источники и их популярность"),
+                BotCommand("aitest", "Проверить перевод (Gemini)"),
                 BotCommand("stop", "Отписаться"),
             ], scope=BotCommandScopeChat(admin))
         except TelegramError as e:
@@ -926,6 +938,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("sources", cmd_sources))
+    app.add_handler(CommandHandler("aitest", cmd_aitest))
     app.add_handler(CommandHandler("archive", cmd_archive))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
