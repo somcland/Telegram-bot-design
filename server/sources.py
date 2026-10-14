@@ -337,12 +337,14 @@ def resolve_telegram(text: str) -> tuple[str, str]:
 # ---------- перевод и хайлайты ----------
 
 LAST_AI_ERROR: dict[str, str] = {}
+GEMINI_PAUSED_UNTIL = [0.0]  # после «квота исчерпана» не долбим API впустую
+QUOTA_PAUSE = 3600
 
 
 def _gemini(prompt: str, max_tokens: int = 500) -> str:
     """Gemini Flash: generateContent, а если его нет — новый Interactions API."""
     key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not key:
+    if not key or time.time() < GEMINI_PAUSED_UNTIL[0]:
         return ""
     model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
     headers = {"x-goog-api-key": key, "content-type": "application/json"}
@@ -352,7 +354,11 @@ def _gemini(prompt: str, max_tokens: int = 500) -> str:
                 "generationConfig": {"maxOutputTokens": max_tokens * 4, "temperature": 0.3}}
         for attempt in range(4):
             r = http().post(f"{base}/models/{model}:generateContent", headers=headers, timeout=120, json=body)
-            if r.status_code in (429, 500, 503) and attempt < 3:  # лимит запросов или перегрузка — ждём
+            if r.status_code == 429 and ("quota" in r.text.lower() and "per minute" not in r.text.lower()):
+                # дневная квота или нет оплаты — повторы только сожгут запросы; пауза на час
+                GEMINI_PAUSED_UNTIL[0] = time.time() + QUOTA_PAUSE
+                break
+            if r.status_code in (429, 500, 503) and attempt < 3:  # лимит в минуту или перегрузка — ждём
                 time.sleep(min(60, 8 * (attempt + 1)))
                 continue
             break
@@ -513,6 +519,10 @@ def ai_check(sample=None) -> str:
     lines = [f"GEMINI_API_KEY: {mask(g)}",
              f"Модель: {os.environ.get('GEMINI_MODEL', 'gemini-3.8-flash')}",
              f"ANTHROPIC_API_KEY: {mask(os.environ.get('ANTHROPIC_API_KEY', ''))}"]
+    if time.time() < GEMINI_PAUSED_UNTIL[0]:
+        left = int((GEMINI_PAUSED_UNTIL[0] - time.time()) / 60)
+        lines.append(f"Gemini на паузе ещё {left} мин после ошибки квоты — проверяю всё равно")
+        GEMINI_PAUSED_UNTIL[0] = 0
     if g.strip():
         LAST_AI_ERROR.pop("gemini", None)
         out = _gemini("Переведи на русский одной строкой: Native page transitions on the web", 100)
