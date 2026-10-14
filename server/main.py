@@ -352,12 +352,25 @@ def untranslated(items, ready) -> dict[str, tuple[str, str]]:
     return out
 
 
+def plain_summary(i) -> str:
+    """Выжимка без нейросети: первое предложение анонса (у видео — описания без ссылок и таймкодов)."""
+    if i["source_kind"] == "youtube":
+        desc = json.loads(i["extra"] or "{}").get("description", "")
+        lines = [l for l in desc.splitlines()
+                 if l.strip() and "http" not in l and not sources.youtube.TIMECODE.match(l)]
+        return sources.few_sentences(" ".join(lines))
+    return sources.few_sentences(i["summary"] or "")
+
+
 def prepare(items) -> dict[str, tuple[str, str]]:
     """Заголовок и хайлайт для каждого материала. Готовые берём из базы, новые считаем и сохраняем."""
     ready, texts = {}, []
     for i in items:
         if i["ru_summary"] is not None:
             ready[i["link"]] = (i["ru_title"] or i["title"], i["ru_summary"])
+        elif i["lang"] != "en":
+            # русское — без нейросети: заголовок как есть и первое предложение анонса
+            ready[i["link"]] = (i["title"], plain_summary(i))
         elif i["source_kind"] == "youtube":
             title, text, by_ai = sources.highlight_video(i)
             ready[i["link"]] = (title, text)
