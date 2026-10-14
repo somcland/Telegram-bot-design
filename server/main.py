@@ -379,6 +379,7 @@ ICONS = {"youtube": "🎬 ", "telegram": "💬 "}
 
 
 def title_line(item, title: str) -> str:
+    title = sources.clean_title(title, item["source_name"])
     return f"{ICONS.get(item['source_kind'], '')}<b>{html.escape(title)}</b>"
 
 
@@ -863,7 +864,9 @@ async def cmd_aitest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(chat_id):
         await update.effective_chat.send_message("Настроить источники — /settings, свежее прямо сейчас — /digest.")
         return
-    report = await asyncio.to_thread(sources.ai_check)
+    sample = storage.recent_english(5)
+    await update.effective_chat.send_message("Проверяю… это займёт до минуты ⏳")
+    report = await asyncio.to_thread(sources.ai_check, sample)
     tr = "вкл" if storage.wants_translation(chat_id) else "выкл"
     await update.effective_chat.send_message(f"🧪 <b>Проверка перевода</b>\nТвоя настройка перевода: {tr}\n\n"
                                              f"<code>{html.escape(report)}</code>", parse_mode=ParseMode.HTML)

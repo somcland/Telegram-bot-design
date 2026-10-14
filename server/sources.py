@@ -101,7 +101,7 @@ def fetch_page(source, known: set[str], max_new: int = 10) -> list[dict]:
                 found[link] = text
     items, fetched = [], 0
     for link, title in found.items():
-        item = {"link": link, "title": short(title, 160), "summary": "", "ts": 0}
+        item = {"link": link, "title": short(clean_title(title, source["name"]), 160), "summary": "", "ts": 0}
         if link not in known and fetched < max_new:  # анонс берём только у новых статей
             fetched += 1
             try:
@@ -109,7 +109,7 @@ def fetch_page(source, known: set[str], max_new: int = 10) -> list[dict]:
                 og = art.find("meta", property="og:title")
                 desc = art.find("meta", property="og:description") or art.find("meta", attrs={"name": "description"})
                 if og and og.get("content"):
-                    item["title"] = short(og["content"], 160)
+                    item["title"] = short(clean_title(og["content"], source["name"]), 160)
                 item["image"] = og_image(art, link)
                 item["summary"] = short(desc.get("content", "") if desc else "", 400)
                 pub = art.find("meta", property="article:published_time")
@@ -348,17 +348,22 @@ def _gemini(prompt: str, max_tokens: int = 500) -> str:
     headers = {"x-goog-api-key": key, "content-type": "application/json"}
     base = "https://generativelanguage.googleapis.com/v1beta"
     try:
-        r = http().post(f"{base}/models/{model}:generateContent", headers=headers, timeout=90, json={
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": max_tokens * 4, "temperature": 0.3}})
-        if r.status_code in (400, 404, 405):  # старый метод недоступен — пробуем новый
-            r = http().post(f"{base}/interactions", headers=headers, timeout=90, json={
+        body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": max_tokens * 4, "temperature": 0.3}}
+        for attempt in range(4):
+            r = http().post(f"{base}/models/{model}:generateContent", headers=headers, timeout=120, json=body)
+            if r.status_code in (429, 500, 503) and attempt < 3:  # лимит запросов или перегрузка — ждём
+                time.sleep(min(60, 8 * (attempt + 1)))
+                continue
+            break
+        if r.status_code in (404, 405):  # старый метод недоступен — пробуем новый
+            r = http().post(f"{base}/interactions", headers=headers, timeout=120, json={
                 "model": model, "input": prompt, "store": False})
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
         data = r.json()
         parts = [p.get("text", "") for c in data.get("candidates", [])
-                 for p in c.get("content", {}).get("parts", [])]
+                 for p in c.get("content", {}).get("parts", []) if not p.get("thought")]
         if not parts:  # ответ Interactions API
             parts = [c.get("text", "") for s in data.get("steps", []) for c in s.get("content", [])
                      if isinstance(c, dict)] or [data.get("output_text", "")]
@@ -397,6 +402,23 @@ def _claude(prompt: str, max_tokens: int = 500) -> str:
         return ""
 
 
+_TITLE_SEP = re.compile(r"\s+[—|–-]\s+")
+
+
+def clean_title(title: str, source_name: str = "") -> str:
+    """Убираем из заголовка название сайта, которое он дописывает в og:title."""
+    title = (title or "").strip()
+    name = re.sub(r"[^\w\s']", "", source_name or "").strip().lower()
+    parts = _TITLE_SEP.split(title)
+    if len(parts) > 1 and name:
+        key = name.split()[0] if name.split()[0] not in ("the", "a") else " ".join(name.split()[:2])
+        for n in range(1, len(parts)):
+            tail = " ".join(parts[n:]).lower()
+            if key and re.search(rf"\b{re.escape(key)}\b", tail):
+                return " — ".join(parts[:n]).strip() if n > 1 else parts[0].strip()
+    return title
+
+
 SENTENCE = re.compile(r"(?<=[.!?…])\s+")
 
 
@@ -411,14 +433,19 @@ def few_sentences(text: str, max_sentences: int = 1, max_len: int = 200) -> str:
     return out or short(text, max_len)
 
 
-def _json_from(text: str):
-    m = re.search(r"(\[.*\]|\{.*\})", text, re.S)
-    if not m:
+def _json_from(text: str, want=None):
+    """Первый корректный JSON в ответе модели (в ```json-блоке, с текстом вокруг — неважно)."""
+    if not text:
         return None
-    try:
-        return json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return None
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"[\[{]", text):
+        try:
+            obj, _ = dec.raw_decode(text[m.start():])
+        except json.JSONDecodeError:
+            continue
+        if want is None or isinstance(obj, want):
+            return obj
+    return None
 
 
 HIGHLIGHT_RULES = (
@@ -432,21 +459,31 @@ HIGHLIGHT_RULES = (
 def highlight_texts(items: list[dict]) -> dict[str, tuple[str, str]]:
     """Статьи и посты пачкой: link → (заголовок на русском, хайлайт)."""
     result = {}
-    for start in range(0, len(items), 12):
-        batch = items[start:start + 12]
-        payload = [{"id": n, "title": i["title"], "text": (i.get("summary") or "")[:1500]}
-                   for n, i in enumerate(batch)]
-        data = _json_from(llm(
-            HIGHLIGHT_RULES + "\n\nДля каждого материала ниже ответь строго JSON-массивом "
-            '[{"id": 0, "title": "...", "highlight": "..."}] без пояснений.\n\n'
-            + json.dumps(payload, ensure_ascii=False), max_tokens=3000))
-        for d in data if isinstance(data, list) else []:
+    for start in range(0, len(items), 8):
+        batch = items[start:start + 8]
+        payload = [{"id": n, "title": clean_title(i["title"], i.get("source_name", "")),
+                    "text": (i.get("summary") or "")[:1200]} for n, i in enumerate(batch)]
+        raw = llm(HIGHLIGHT_RULES + "\n\nДля каждого материала ниже ответь строго JSON-массивом "
+                  '[{"id": 0, "title": "...", "highlight": "..."}] без пояснений.\n\n'
+                  + json.dumps(payload, ensure_ascii=False), max_tokens=2500)
+        data = _json_from(raw, list) or []
+        for d in data:
             try:
                 item = batch[int(d["id"])]
             except (KeyError, ValueError, IndexError, TypeError):
                 continue
-            if d.get("highlight"):
-                result[item["link"]] = (d.get("title") or item["title"], d["highlight"].strip())
+            if isinstance(d, dict) and d.get("highlight"):
+                result[item["link"]] = (d.get("title") or item["title"], str(d["highlight"]).strip())
+        missed = [i for i in batch if i["link"] not in result]
+        if missed and raw:
+            LAST_AI_ERROR["batch"] = f"разобрано {len(batch) - len(missed)} из {len(batch)}; ответ: {raw[:300]}"
+        for i in missed if raw else []:  # модель ответила, но не всё разобралось — по одному
+            one = _json_from(llm(
+                HIGHLIGHT_RULES + ' Ответь строго JSON: {"title": "...", "highlight": "..."}.\n\n'
+                f"Заголовок: {clean_title(i['title'], i.get('source_name', ''))}\n\n"
+                f"Текст: {(i.get('summary') or '')[:1200]}", max_tokens=400), dict)
+            if one and one.get("highlight"):
+                result[i["link"]] = (one.get("title") or i["title"], str(one["highlight"]).strip())
     return result
 
 
@@ -467,7 +504,7 @@ def highlight_video(item) -> tuple[str, str, bool]:
     return item["title"], few_sentences(" ".join(lines)), False
 
 
-def ai_check() -> str:
+def ai_check(sample=None) -> str:
     """Диагностика перевода для админа: ключи, модель и пробный запрос."""
     def mask(v):
         v = v.strip()
@@ -480,4 +517,15 @@ def ai_check() -> str:
         LAST_AI_ERROR.pop("gemini", None)
         out = _gemini("Переведи на русский одной строкой: Native page transitions on the web", 100)
         lines.append(f"Ответ Gemini: {out!r}" if out else f"Ошибка Gemini: {LAST_AI_ERROR.get('gemini', 'пустой ответ')}")
+        if out and sample:  # как в настоящей подборке: пачка английских материалов
+            LAST_AI_ERROR.pop("batch", None)
+            done = highlight_texts([dict(i) for i in sample])
+            lines.append(f"\nПачка из {len(sample)} англ. материалов: переведено {len(done)}")
+            for i in sample[:3]:
+                t = done.get(i["link"])
+                lines.append(f"• {i['title'][:50]} → {t[0][:60] if t else '—'}")
+            if "batch" in LAST_AI_ERROR:
+                lines.append(f"Проблема: {LAST_AI_ERROR['batch']}")
+            if "gemini" in LAST_AI_ERROR:
+                lines.append(f"Ошибка Gemini: {LAST_AI_ERROR['gemini']}")
     return "\n".join(lines)

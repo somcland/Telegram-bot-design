@@ -430,3 +430,12 @@ def admin_sources() -> list[sqlite3.Row]:
                  (SELECT name FROM users WHERE chat_id=s.added_by) AS author
                FROM sources s
                ORDER BY subscribers DESC, s.builtin DESC, s.name""", (week,)).fetchall()
+
+
+def recent_english(limit: int = 5) -> list[sqlite3.Row]:
+    """Свежие англоязычные материалы — для проверки перевода в /aitest."""
+    with connect() as c:
+        return c.execute("""SELECT i.*, s.name AS source_name, s.kind AS source_kind, s.lang AS lang
+                            FROM items i JOIN sources s ON s.id=i.source_id
+                            WHERE s.lang='en' AND s.kind!='youtube'
+                            ORDER BY i.ts DESC LIMIT ?""", (limit,)).fetchall()
