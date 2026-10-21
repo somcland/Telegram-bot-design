@@ -392,9 +392,18 @@ def _gemini(prompt: str, max_tokens: int = 500) -> str:
         return ""
 
 
+LAST_PROVIDER = [""]  # кто ответил на последний запрос — для /aitest
+
+
 def llm(prompt: str, max_tokens: int = 500) -> str:
-    """Переводы и хайлайты: сначала Gemini Flash, если не вышло — Claude."""
-    return _gemini(prompt, max_tokens) or _claude(prompt, max_tokens)
+    """Переводы и хайлайты: сначала Gemini Flash; кончилась квота или ошибка — сразу Claude."""
+    out = _gemini(prompt, max_tokens)
+    if out:
+        LAST_PROVIDER[0] = "Gemini"
+        return out
+    out = _claude(prompt, max_tokens)
+    LAST_PROVIDER[0] = "Claude" if out else ""
+    return out
 
 
 def has_llm() -> bool:
@@ -419,6 +428,8 @@ def _claude(prompt: str, max_tokens: int = 500) -> str:
         _count_usage("claude", u.get("input_tokens", 0), u.get("output_tokens", 0))
         return "".join(b.get("text", "") for b in data.get("content", [])).strip()
     except Exception as e:
+        body = getattr(getattr(e, "response", None), "text", "") or ""
+        LAST_AI_ERROR["claude"] = f"{e} {body[:300]}".strip()[:400]
         print(f"[!] Claude: {e}", file=sys.stderr)
         return ""
 
@@ -526,31 +537,59 @@ def highlight_video(item) -> tuple[str, str, bool]:
 
 
 def ai_check(sample=None) -> str:
-    """Диагностика перевода для админа: ключи, модель и пробный запрос."""
+    """Диагностика перевода для админа: ключи, Gemini, запасной Claude и пробная пачка."""
     def mask(v):
         v = v.strip()
         return f"есть ({v[:4]}…{v[-3:]}, {len(v)} симв.)" if v else "нет"
-    g = os.environ.get("GEMINI_API_KEY", "")
-    lines = [f"GEMINI_API_KEY: {mask(g)}",
-             f"Модель: {os.environ.get('GEMINI_MODEL', 'gemini-3.8-flash')}",
-             f"ANTHROPIC_API_KEY: {mask(os.environ.get('ANTHROPIC_API_KEY', ''))}"]
-    if time.time() < GEMINI_PAUSED_UNTIL[0]:
-        left = int((GEMINI_PAUSED_UNTIL[0] - time.time()) / 60)
-        lines.append(f"Gemini на паузе ещё {left} мин после ошибки квоты — проверяю всё равно")
-        GEMINI_PAUSED_UNTIL[0] = 0
-    if g.strip():
+    test = "Переведи на русский одной строкой: Native page transitions on the web"
+    g = os.environ.get("GEMINI_API_KEY", "").strip()
+    a = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    lines = [f"GEMINI_API_KEY: {mask(g)} · {os.environ.get('GEMINI_MODEL', 'gemini-3.8-flash')}",
+             f"ANTHROPIC_API_KEY: {mask(a)} · {os.environ.get('ANTHROPIC_MODEL', 'claude-haiku-5-5')}", ""]
+
+    gemini_ok = claude_ok = False
+    if g:
+        paused = time.time() < GEMINI_PAUSED_UNTIL[0]
+        saved_pause = GEMINI_PAUSED_UNTIL[0]
+        GEMINI_PAUSED_UNTIL[0] = 0  # проверяем честно, даже если бот поставил паузу
         LAST_AI_ERROR.pop("gemini", None)
-        out = _gemini("Переведи на русский одной строкой: Native page transitions on the web", 100)
-        lines.append(f"Ответ Gemini: {out!r}" if out else f"Ошибка Gemini: {LAST_AI_ERROR.get('gemini', 'пустой ответ')}")
-        if out and sample:  # как в настоящей подборке: пачка английских материалов
-            LAST_AI_ERROR.pop("batch", None)
-            done = highlight_texts([dict(i) for i in sample])
-            lines.append(f"\nПачка из {len(sample)} англ. материалов: переведено {len(done)}")
-            for i in sample[:3]:
-                t = done.get(i["link"])
-                lines.append(f"• {i['title'][:50]} → {t[0][:60] if t else '—'}")
-            if "batch" in LAST_AI_ERROR:
-                lines.append(f"Проблема: {LAST_AI_ERROR['batch']}")
-            if "gemini" in LAST_AI_ERROR:
-                lines.append(f"Ошибка Gemini: {LAST_AI_ERROR['gemini']}")
+        out = _gemini(test, 100)
+        gemini_ok = bool(out)
+        if out:
+            lines.append(f"✅ Gemini: {out!r}")
+        else:
+            err = LAST_AI_ERROR.get("gemini", "пустой ответ")
+            quota = "429" in err or "quota" in err.lower()
+            lines.append("⛔ Gemini: закончилась квота" if quota else f"❌ Gemini: {err[:200]}")
+            if paused:
+                GEMINI_PAUSED_UNTIL[0] = max(GEMINI_PAUSED_UNTIL[0], saved_pause)
+    else:
+        lines.append("— Gemini: ключа нет")
+    if a:
+        LAST_AI_ERROR.pop("claude", None)
+        out = _claude(test, 100)
+        claude_ok = bool(out)
+        lines.append(f"✅ Claude: {out!r}" if out else f"❌ Claude: {LAST_AI_ERROR.get('claude', 'пустой ответ')[:200]}")
+    else:
+        lines.append("— Claude: ключа нет")
+
+    lines.append("")
+    if gemini_ok:
+        lines.append("Сейчас переводит: Gemini" + (" (Claude в запасе, если кончится квота)" if claude_ok else
+                                                   " (запасного нет — добавь ANTHROPIC_API_KEY)"))
+    elif claude_ok:
+        lines.append("Сейчас переводит: Claude — Gemini недоступен, бот переключился автоматически")
+    else:
+        lines.append("⚠️ Сейчас никто не переводит — английские материалы придут в оригинале")
+
+    if (gemini_ok or claude_ok) and sample:  # как в настоящей подборке: пачка английских материалов
+        LAST_AI_ERROR.pop("batch", None)
+        done = highlight_texts([dict(i) for i in sample])
+        lines.append(f"\nПачка из {len(sample)} англ. материалов: переведено {len(done)}"
+                     + (f" (через {LAST_PROVIDER[0]})" if LAST_PROVIDER[0] else ""))
+        for i in sample[:3]:
+            t = done.get(i["link"])
+            lines.append(f"• {i['title'][:50]} → {t[0][:60] if t else '—'}")
+        if "batch" in LAST_AI_ERROR:
+            lines.append(f"Проблема: {LAST_AI_ERROR['batch']}")
     return "\n".join(lines)
