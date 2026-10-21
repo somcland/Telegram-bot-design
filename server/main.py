@@ -41,6 +41,9 @@ MSK = ZoneInfo("Europe/Moscow")
 DEFAULT_HOUR = 10
 HOURS = list(range(6, 24))
 CATCH_UP_HOURS = 3   # если бот был выключен в нужный час — досылаем в течение 3 часов
+SEND_EARLY_MIN = 10  # выпуск приходит за столько минут до выбранного часа (10:00 → 9:50)
+PREP_LEAD_MIN = 40   # подготовку (сбор, перевод, картинки) начинаем за столько минут до отправки
+FRESH_SEC = 25 * 60  # источник, собранный недавно, повторно перед отправкой не дёргаем
 TIMEZONES = [
     ("Europe/Kaliningrad", "Калининград"), ("Europe/Moscow", "Москва"),
     ("Europe/Samara", "Самара"), ("Asia/Yekaterinburg", "Екатеринбург"),
@@ -301,12 +304,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- сбор и рассылка ----------
 
-FETCH_WORKERS = 8                  # сколько источников собираем одновременно
+FETCH_WORKERS = 12                 # сколько источников собираем одновременно
 TG_LIMIT = threading.Semaphore(3)  # t.me не любит много запросов разом
 SEND_CONCURRENCY = 8               # скольким подписчикам шлём одновременно (лимит Telegram ~30 сообщений/с)
 
 
 def refresh_one(s) -> None:
+    _last_fetch[s["id"]] = time.time()
     first_time = not storage.known_links(s["id"])
     if s["kind"] == "telegram":
         with TG_LIMIT:
@@ -696,30 +700,70 @@ async def job_refresh(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await asyncio.to_thread(refresh, storage.subscribed_sources())
 
 
-def due_users(now: dt.datetime | None = None) -> list:
-    """Кому пора отправить: наступил их час в их часовом поясе, а сегодня ещё не отправляли."""
+def send_time(u, now: dt.datetime) -> tuple[str, dt.datetime]:
+    """Дата выпуска (по часам подписчика) и момент отправки сегодня."""
+    try:
+        tz = ZoneInfo(u["tz"] or "Europe/Moscow")
+    except Exception:
+        tz = MSK
+    local = now.astimezone(tz)
+    hour = u["hour"] if u["hour"] is not None else DEFAULT_HOUR
+    at = local.replace(hour=hour, minute=0, second=0, microsecond=0) - dt.timedelta(minutes=SEND_EARLY_MIN)
+    return local.date().isoformat(), at
+
+
+def due_users(now: dt.datetime | None = None, ahead_min: int = 0) -> list:
+    """Кому пора отправить (ahead_min > 0 — кому подойдёт время в ближайшие минуты),
+    а сегодня ещё не отправляли."""
     now = now or dt.datetime.now(dt.timezone.utc)
     due = []
     for u in storage.active_users():
-        try:
-            local = now.astimezone(ZoneInfo(u["tz"] or "Europe/Moscow"))
-        except Exception:
-            local = now.astimezone(MSK)
-        hour = u["hour"] if u["hour"] is not None else DEFAULT_HOUR
-        if hour <= local.hour < hour + CATCH_UP_HOURS and u["last_sent"] != local.date().isoformat():
-            due.append((u["chat_id"], local.date().isoformat()))
+        day, at = send_time(u, now)
+        if u["last_sent"] == day:
+            continue
+        if ahead_min:
+            if at - dt.timedelta(minutes=ahead_min) <= now < at:
+                due.append((u["chat_id"], day))
+        elif at <= now < at + dt.timedelta(hours=CATCH_UP_HOURS):
+            due.append((u["chat_id"], day))
     return due
 
 
+_last_fetch: dict[str, float] = {}  # id источника → когда последний раз собирали
+_prepared: set[tuple[int, str]] = set()  # (подписчик, дата) — выпуск уже подготовлен
+
+
+def stale_sources(chat_ids) -> list:
+    ids = sorted({sid for c in chat_ids for sid in storage.user_source_ids(c)})
+    fresh_after = time.time() - FRESH_SEC
+    return [s for s in storage.sources_by_ids(ids) if _last_fetch.get(s["id"], 0) < fresh_after]
+
+
+async def job_prepare(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в 5 минут: тем, кому выпуск уйдёт в ближайшие PREP_LEAD_MIN минут, собираем всё заранее —
+    к моменту отправки остаётся только нажать «отправить»."""
+    soon = [(c, d) for c, d in due_users(ahead_min=PREP_LEAD_MIN) if (c, d) not in _prepared]
+    if not soon:
+        return
+    started = time.time()
+    chat_ids = [c for c, _ in soon]
+    await asyncio.to_thread(refresh, stale_sources(chat_ids))
+    await asyncio.to_thread(warm_up, chat_ids)
+    _prepared.update(soon)
+    log.info("подготовка заранее: %d подписчиков за %.0f с", len(soon), time.time() - started)
+
+
 async def job_send(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Раз в 10 минут: кому пора — тем подборка."""
+    """Раз в минуту: кому пора — тем подборка. Обычно всё уже подготовлено заранее."""
     due = due_users()
     if not due:
         return
     started = time.time()
-    ids = sorted({sid for chat_id, _ in due for sid in storage.user_source_ids(chat_id)})
-    await asyncio.to_thread(refresh, storage.sources_by_ids(ids))
-    await asyncio.to_thread(warm_up, [chat_id for chat_id, _ in due])
+    chat_ids = [c for c, _ in due]
+    late = [c for c, d in due if (c, d) not in _prepared]
+    if late:  # подготовка не успела (бот только запустился, сменили время) — доделываем сейчас
+        await asyncio.to_thread(refresh, stale_sources(late))
+        await asyncio.to_thread(warm_up, late)
     log.info("рассылка: %d подписчиков (подготовка %.0f с)", len(due), time.time() - started)
 
     gate = asyncio.Semaphore(SEND_CONCURRENCY)
@@ -744,6 +788,7 @@ async def job_send(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             storage.set_last_sent(chat_id, day)
 
     await asyncio.gather(*(deliver(c, d) for c, d in due))
+    _prepared.difference_update(due)
     log.info("рассылка готова за %.0f с", time.time() - started)
 
 
@@ -1012,7 +1057,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
     app.add_error_handler(on_error)
-    app.job_queue.run_repeating(job_send, interval=600, first=30, name="send")
+    app.job_queue.run_repeating(job_send, interval=60, first=30, name="send")
+    app.job_queue.run_repeating(job_prepare, interval=300, first=20, name="prepare")
     app.job_queue.run_repeating(job_cleanup, interval=24 * 3600, first=3600, name="cleanup")
     app.job_queue.run_repeating(job_refresh, interval=3 * 3600, first=60, name="refresh")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)

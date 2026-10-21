@@ -8,6 +8,7 @@ import time
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 import sys
 from urllib.parse import urljoin, urlsplit
 
@@ -54,7 +55,7 @@ def http() -> requests.Session:
 
 
 def _get(url: str, **kw) -> requests.Response:
-    r = http().get(url, headers=HEADERS, timeout=30, **kw)
+    r = http().get(url, headers=HEADERS, timeout=kw.pop("timeout", (6, 20)), **kw)
     r.raise_for_status()
     return r
 
@@ -99,26 +100,35 @@ def fetch_page(source, known: set[str], max_new: int = 10) -> list[dict]:
             text = a.get_text(" ", strip=True)
             if len(text) > len(found.get(link, "")):
                 found[link] = text
-    items, fetched = [], 0
-    for link, title in found.items():
+    def article(link: str, title: str) -> dict:
         item = {"link": link, "title": short(clean_title(title, source["name"]), 160), "summary": "", "ts": 0}
-        if link not in known and fetched < max_new:  # анонс берём только у новых статей
-            fetched += 1
-            try:
-                art = BeautifulSoup(_get(link).text, "html.parser")
-                og = art.find("meta", property="og:title")
-                desc = art.find("meta", property="og:description") or art.find("meta", attrs={"name": "description"})
-                if og and og.get("content"):
-                    item["title"] = short(clean_title(og["content"], source["name"]), 160)
-                item["image"] = og_image(art, link)
-                item["summary"] = short(desc.get("content", "") if desc else "", 400)
-                pub = art.find("meta", property="article:published_time")
-                if pub and pub.get("content"):
-                    from datetime import datetime
-                    item["ts"] = datetime.fromisoformat(pub["content"].replace("Z", "+00:00")).timestamp()
-            except Exception:
-                pass
-        elif link not in known:
+        try:
+            art = BeautifulSoup(_get(link).text, "html.parser")
+            og = art.find("meta", property="og:title")
+            desc = art.find("meta", property="og:description") or art.find("meta", attrs={"name": "description"})
+            if og and og.get("content"):
+                item["title"] = short(clean_title(og["content"], source["name"]), 160)
+            item["image"] = og_image(art, link)
+            item["summary"] = short(desc.get("content", "") if desc else "", 400)
+            pub = art.find("meta", property="article:published_time")
+            if pub and pub.get("content"):
+                from datetime import datetime
+                item["ts"] = datetime.fromisoformat(pub["content"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            pass
+        return item
+
+    # анонс берём только у новых статей, и страницы статей качаем параллельно
+    new = [(l, t) for l, t in found.items() if l not in known][:max_new]
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        fetched = {i["link"]: i for i in ex.map(lambda a: article(*a), new)}
+    items = []
+    for link, title in found.items():
+        if link in fetched:
+            item = fetched[link]
+        elif link in known:
+            item = {"link": link, "title": short(clean_title(title, source["name"]), 160), "summary": "", "ts": 0}
+        else:
             continue  # остальные новые подтянем в следующий раз
         if item["title"]:
             items.append(item)
