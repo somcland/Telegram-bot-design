@@ -872,6 +872,57 @@ def is_admin(chat_id: int) -> bool:
     return chat_id in ADMIN_IDS
 
 
+# цены за 1 млн токенов: (вход, выход)
+PRICES = {"Haiku 5.5": (0.10, 0.50), "Sonnet 5.5": (2.0, 10.0)}
+PROMPT_OVERHEAD = 250       # токенов инструкции на один запрос
+OUT_PER_ITEM = 80           # токенов ответа на материал: заголовок + одно предложение
+TRANSCRIPT_TOKENS = 10_000  # субтитры видео (если YouTube их отдал)
+
+
+def format_usage(r: dict) -> str:
+    rows = r["per_day"]
+    lines = ["💸 <b>Расход на перевод</b>",
+             f"Подписчиков: {r['users']} · англ. источников с подписчиками: {r['en_sources']}", "",
+             "<b>Английские материалы по дням</b>",
+             "<code>день  статей(перев.) видео(перев.)</code>"]
+    for d in rows:
+        lines.append(f"<code>{d['d'][5:]}  {d['arts']:>3} ({d['arts_tr']:>3})   {d['vids']:>2} ({d['vids_tr']:>2})</code>")
+    if not rows:
+        lines.append("пока пусто")
+    n_days = max(1, len(rows))
+    arts = sum(d["arts_tr"] or 0 for d in rows)
+    vids = sum(d["vids_tr"] or 0 for d in rows)
+    chars = sum(d["chars_tr"] or 0 for d in rows)
+    # статьи идут пачками по 8: инструкция на пачку + текст (~4 символа на токен) + ответ
+    t_in = chars / 4 + PROMPT_OVERHEAD * (arts / 8 + 1) + vids * (TRANSCRIPT_TOKENS + 1500)
+    t_out = (arts + vids) * OUT_PER_ITEM
+    per_day_in, per_day_out = t_in / n_days, t_out / n_days
+    lines += ["", f"Переведено за {n_days} дн.: статей {arts}, видео {vids}",
+              f"≈ {per_day_in:,.0f} токенов на вход и {per_day_out:,.0f} на выход в день".replace(",", " "),
+              "", "<b>Оценка в месяц</b>"]
+    for name, (p_in, p_out) in PRICES.items():
+        month = 30 * (per_day_in * p_in + per_day_out * p_out) / 1_000_000
+        months = (5 / month) if month else 999
+        lasts = "на весь год (кредиты живут 12 мес.)" if months >= 12 else f"на ~{months:.0f} мес."
+        lines.append(f"{name}: ≈ ${month:.2f} в месяц · $5 хватит {lasts}")
+    if r["real"]:
+        lines += ["", "<b>Фактически (по ответам API)</b>"]
+        for u in r["real"][:10]:
+            lines.append(f"<code>{u['day'][5:]} {u['provider']:<6} {u['calls']:>3} запр. · "
+                         f"{u['tokens_in']:>7} вх · {u['tokens_out']:>6} вых</code>")
+    lines += ["", "<i>Оценка по объёму текста; фактические цифры копятся с момента обновления.</i>"]
+    return "\n".join(lines)
+
+
+async def cmd_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.effective_chat.send_message("Настроить источники — /settings, свежее прямо сейчас — /digest.")
+        return
+    r = await asyncio.to_thread(storage.usage_report)
+    await update.effective_chat.send_message(format_usage(r), parse_mode=ParseMode.HTML)
+
+
 async def cmd_aitest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
@@ -929,6 +980,7 @@ async def post_init(app: Application) -> None:
                 BotCommand("stats", "Статистика бота"),
                 BotCommand("sources", "Все источники и их популярность"),
                 BotCommand("aitest", "Проверить перевод (Gemini)"),
+                BotCommand("usage", "Расход на перевод"),
                 BotCommand("stop", "Отписаться"),
             ], scope=BotCommandScopeChat(admin))
         except TelegramError as e:
@@ -955,6 +1007,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("sources", cmd_sources))
     app.add_handler(CommandHandler("aitest", cmd_aitest))
+    app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("archive", cmd_archive))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))

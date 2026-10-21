@@ -95,6 +95,8 @@ def init() -> None:
                 c.execute(f"ALTER TABLE sources ADD COLUMN {col} {typ}")
         c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS events (chat_id INTEGER, kind TEXT, at REAL)")
+        c.execute("""CREATE TABLE IF NOT EXISTS ai_usage (day TEXT, provider TEXT, calls INTEGER,
+                     tokens_in INTEGER, tokens_out INTEGER, PRIMARY KEY (day, provider))""")
         c.execute("""CREATE TABLE IF NOT EXISTS issues (
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, created_at REAL,
             title TEXT, links TEXT, page INTEGER DEFAULT 0, msg_ids TEXT DEFAULT '[]')""")
@@ -439,3 +441,38 @@ def recent_english(limit: int = 5) -> list[sqlite3.Row]:
                             FROM items i JOIN sources s ON s.id=i.source_id
                             WHERE s.lang='en' AND s.kind!='youtube'
                             ORDER BY i.ts DESC LIMIT ?""", (limit,)).fetchall()
+
+
+# ---------- расход нейросетей ----------
+
+def add_ai_usage(provider: str, tokens_in: int, tokens_out: int) -> None:
+    day = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 3 * 3600))
+    with connect() as c:
+        c.execute("""INSERT INTO ai_usage VALUES (?, ?, 1, ?, ?)
+                     ON CONFLICT(day, provider) DO UPDATE SET calls=calls+1,
+                       tokens_in=tokens_in+excluded.tokens_in, tokens_out=tokens_out+excluded.tokens_out""",
+                  (day, provider, tokens_in, tokens_out))
+
+
+def usage_report(days: int = 14) -> dict:
+    since = time.time() - days * 86400
+    with connect() as c:
+        per_day = c.execute(
+            """SELECT date(i.fetched_at,'unixepoch','+3 hours') d,
+                 SUM(s.kind!='youtube') arts, SUM(s.kind='youtube') vids,
+                 SUM(i.ru_summary IS NOT NULL AND s.kind!='youtube') arts_tr,
+                 SUM(i.ru_summary IS NOT NULL AND s.kind='youtube') vids_tr,
+                 SUM(CASE WHEN i.ru_summary IS NOT NULL AND s.kind!='youtube'
+                     THEN LENGTH(i.title)+LENGTH(COALESCE(i.summary,'')) ELSE 0 END) chars_tr,
+                 SUM(CASE WHEN i.ru_summary IS NOT NULL AND s.kind='youtube'
+                     THEN LENGTH(COALESCE(i.extra,'')) ELSE 0 END) vchars_tr
+               FROM items i JOIN sources s ON s.id=i.source_id
+               WHERE s.lang='en' AND i.fetched_at>=?
+               GROUP BY d ORDER BY d""", (since,)).fetchall()
+        real = c.execute("SELECT * FROM ai_usage ORDER BY day DESC LIMIT 30").fetchall()
+        en_sources = c.execute("""SELECT COUNT(DISTINCT s.id) FROM sources s
+                                  JOIN subs ON subs.source_id=s.id
+                                  JOIN users u ON u.chat_id=subs.chat_id AND u.active=1
+                                  WHERE s.lang='en'""").fetchone()[0]
+        users = c.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0]
+    return {"per_day": per_day, "real": real, "en_sources": en_sources, "users": users, "days": days}

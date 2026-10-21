@@ -337,6 +337,14 @@ def resolve_telegram(text: str) -> tuple[str, str]:
 # ---------- перевод и хайлайты ----------
 
 LAST_AI_ERROR: dict[str, str] = {}
+
+
+def _count_usage(provider: str, tokens_in: int, tokens_out: int) -> None:
+    try:
+        from . import storage
+        storage.add_ai_usage(provider, int(tokens_in or 0), int(tokens_out or 0))
+    except Exception as e:
+        print(f"[!] учёт токенов: {e}", file=sys.stderr)
 GEMINI_PAUSED_UNTIL = [0.0]  # после «квота исчерпана» не долбим API впустую
 QUOTA_PAUSE = 3600
 
@@ -368,6 +376,10 @@ def _gemini(prompt: str, max_tokens: int = 500) -> str:
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
         data = r.json()
+        um = data.get("usageMetadata") or data.get("usage") or {}
+        _count_usage("gemini", um.get("promptTokenCount") or um.get("input_tokens") or 0,
+                     (um.get("candidatesTokenCount") or 0) + (um.get("thoughtsTokenCount") or 0)
+                     or um.get("output_tokens") or 0)
         parts = [p.get("text", "") for c in data.get("candidates", [])
                  for p in c.get("content", {}).get("parts", []) if not p.get("thought")]
         if not parts:  # ответ Interactions API
@@ -402,7 +414,10 @@ def _claude(prompt: str, max_tokens: int = 500) -> str:
                   "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
             timeout=90)
         r.raise_for_status()
-        return "".join(b.get("text", "") for b in r.json().get("content", [])).strip()
+        data = r.json()
+        u = data.get("usage") or {}
+        _count_usage("claude", u.get("input_tokens", 0), u.get("output_tokens", 0))
+        return "".join(b.get("text", "") for b in data.get("content", [])).strip()
     except Exception as e:
         print(f"[!] Claude: {e}", file=sys.stderr)
         return ""
